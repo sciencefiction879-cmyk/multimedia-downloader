@@ -1,0 +1,159 @@
+name: Build and Release MultiDownloader
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (e.g. v2.8.0)'
+        required: true
+        default: 'v2.8.0'
+      publish_release:
+        description: 'Publish as GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows Executable
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Build Standalone Windows Executable with PyInstaller
+        run: |
+          python -m PyInstaller --clean MultiDownloader.spec
+
+      - name: Verify and Package Windows Output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/MultiDownloader.exe")) {
+            Write-Error "dist/MultiDownloader.exe was not created!"
+            exit 1
+          }
+          Write-Host "MultiDownloader.exe size: $((Get-Item 'dist/MultiDownloader.exe').Length / 1MB) MB"
+          Compress-Archive -Path "dist/MultiDownloader.exe" -DestinationPath "dist/MultiDownloader-Windows-x64.zip" -Force
+
+      - name: Upload Windows Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: |
+            dist/MultiDownloader.exe
+            dist/MultiDownloader-Windows-x64.zip
+
+  build-macos:
+    name: Build macOS Application & DMG
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile macOS Application
+        run: |
+          # Make scripts executable
+          chmod +x build_macos.sh
+          # Build .app and DMG
+          bash build_macos.sh
+
+      - name: Package macOS App Zip
+        run: |
+          ditto -c -k --keepParent dist/MultiDownloader.app dist/MultiDownloader-macOS.zip
+
+      - name: Upload macOS Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: |
+            dist/MultiDownloader.dmg
+            dist/MultiDownloader-macOS.zip
+
+  create-release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == true)
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-artifacts
+          path: release-assets/
+
+      - name: Download macOS Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-artifacts
+          path: release-assets/
+
+      - name: Determine Release Tag
+        id: get_tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG_NAME=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_tag.outputs.TAG_NAME }}
+          name: "Multi Downloader ${{ steps.get_tag.outputs.TAG_NAME }}"
+          body: |
+            ## 🚀 Multi Downloader Release ${{ steps.get_tag.outputs.TAG_NAME }}
+
+            Modern YouTube Channel & Media Downloader with Competitor Metadata Extraction & Assets Suite.
+
+            ### ✨ What's Included:
+            - **Competitor Metadata Extraction & Purification**: Auto-purifies URLs, social links, promos, and channel branding.
+            - **Sequential Thumbnails**: High-resolution thumbnails (`V1 Thumbnail.jpg`, `V2 Thumbnail.jpg`...).
+            - **Channel Assets**: High-resolution Channel Banner & Channel Logo downloader.
+            - **Organized Titles & Scripts**: Saves in single `Titles/` folder with Channel Name & Link header, plus clean voiceover scripts.
+            - **Parallel MP3 Voiceovers**: Concurrent high-speed audio extraction.
+
+            ### 📦 Download Assets:
+            - **Windows**: `MultiDownloader.exe` (Standalone portable single-file executable) or `MultiDownloader-Windows-x64.zip`
+            - **macOS**: `MultiDownloader.dmg` (Installer disk image) or `MultiDownloader-macOS.zip`
+          files: |
+            release-assets/MultiDownloader.exe
+            release-assets/MultiDownloader-Windows-x64.zip
+            release-assets/MultiDownloader.dmg
+            release-assets/MultiDownloader-macOS.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

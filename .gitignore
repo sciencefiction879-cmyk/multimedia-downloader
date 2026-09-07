@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# App bundles & executables
+MultiDownloader.app/
+*.dmg
+*.exe
+
+# Virtual environments
+.venv
+venv/
+ENV/
+
+# User data, database & runtime logs
+*.log
+*.db
+settings.json
+sections.json
+queue.json
+
+# Operating System
+.DS_Store
+Thumbs.db
