@@ -102,19 +102,21 @@ jobs:
     name: Publish GitHub Release
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == true)
+    if: always() && (needs.build-windows.result == 'success' || needs.build-macos.result == 'success') && (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == true))
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Download Windows Artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: windows-artifacts
           path: release-assets/
 
       - name: Download macOS Artifacts
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: macos-artifacts
           path: release-assets/
@@ -139,20 +141,16 @@ jobs:
             Modern YouTube Channel & Media Downloader with Competitor Metadata Extraction & Assets Suite.
 
             ### ✨ What's Included:
-            - **Competitor Metadata Extraction & Purification**: Auto-purifies URLs, social links, promos, and channel branding.
-            - **Sequential Thumbnails**: High-resolution thumbnails (`V1 Thumbnail.jpg`, `V2 Thumbnail.jpg`...).
-            - **Channel Assets**: High-resolution Channel Banner & Channel Logo downloader.
+            - **Competitor Metadata Extraction & Purification**: Auto-purifies URLs, social links, promos, and channel branding into `Metadata/`.
+            - **Sequential Thumbnails**: High-resolution thumbnails (`V1 Thumbnail.jpg`, `V2 Thumbnail.jpg`...) in `Thumbnails/`.
+            - **Channel Assets**: High-resolution Channel Banner & Channel Logo in `Channel Assets/`.
             - **Organized Titles & Scripts**: Saves in single `Titles/` folder with Channel Name & Link header, plus clean voiceover scripts.
             - **Parallel MP3 Voiceovers**: Concurrent high-speed audio extraction.
 
             ### 📦 Download Assets:
             - **Windows**: `MultiDownloader.exe` (Standalone portable single-file executable) or `MultiDownloader-Windows-x64.zip`
             - **macOS**: `MultiDownloader.dmg` (Installer disk image) or `MultiDownloader-macOS.zip`
-          files: |
-            release-assets/MultiDownloader.exe
-            release-assets/MultiDownloader-Windows-x64.zip
-            release-assets/MultiDownloader.dmg
-            release-assets/MultiDownloader-macOS.zip
+          files: release-assets/*
           draft: false
           prerelease: false
         env:

@@ -8,11 +8,14 @@ echo "=========================================="
 echo " Building MultiDownloader for macOS"
 echo "=========================================="
 
-VENV_PYTHON="$DIR/.venv/bin/python"
-VENV_PYINSTALLER="$DIR/.venv/bin/pyinstaller"
-
-if [ ! -f "$VENV_PYTHON" ]; then
-    echo "Virtual environment not found. Please ensure dependencies are installed."
+if [ -f "$DIR/.venv/bin/python" ]; then
+    VENV_PYTHON="$DIR/.venv/bin/python"
+elif command -v python3 &> /dev/null; then
+    VENV_PYTHON="$(command -v python3)"
+elif command -v python &> /dev/null; then
+    VENV_PYTHON="$(command -v python)"
+else
+    echo "Python not found. Please ensure dependencies are installed."
     exit 1
 fi
 
@@ -65,8 +68,8 @@ echo "-> Updating local workspace MultiDownloader.app..."
 rm -rf "$DIR/MultiDownloader.app"
 cp -R "$DIR/dist/MultiDownloader.app" "$DIR/MultiDownloader.app"
 
-# Sync to /Applications if installed there
-if [ -d "/Applications/MultiDownloader.app" ] || [ -w "/Applications" ]; then
+# Sync to /Applications if installed there and not in CI
+if [ "$CI" != "true" ] && ([ -d "/Applications/MultiDownloader.app" ] || [ -w "/Applications" ]); then
     echo "-> Installing updated build directly to /Applications/MultiDownloader.app..."
     rm -rf "/Applications/MultiDownloader.app"
     cp -R "$DIR/dist/MultiDownloader.app" "/Applications/MultiDownloader.app"
