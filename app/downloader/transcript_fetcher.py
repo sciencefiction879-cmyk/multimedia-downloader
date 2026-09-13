@@ -6,7 +6,7 @@ import os
 import re
 import zipfile
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from youtube_transcript_api import YouTubeTranscriptApi
 from app.core.exceptions import TranscriptError
 from app.utils.logger import logger
@@ -100,13 +100,36 @@ class TranscriptFetcher:
 
     @staticmethod
     def fetch_video_transcript(video_id: str, languages: List[str] = None) -> Optional[str]:
+        text, _, _ = TranscriptFetcher.fetch_video_transcript_with_diagnostics(video_id, languages)
+        return text
+
+    @staticmethod
+    def fetch_video_transcript_with_diagnostics(
+        video_id: str,
+        languages: List[str] = None,
+    ) -> Tuple[Optional[str], str, Optional[str]]:
+        """
+        Actively and exhaustively searches for transcripts using 5 retrieval methods:
+        1. youtube_transcript_api direct manual captions (English & requested variants)
+        2. youtube_transcript_api auto-generated captions
+        3. youtube_transcript_api translatable tracks (translated to English)
+        4. yt-dlp subtitle tracks & automatic captions extraction (JSON3, VTT, SRV1, TTML)
+        5. Direct YouTube Innertube timedtext extraction from player response
+        
+        Returns:
+            Tuple[Optional[str], str, Optional[str]]: (cleaned_text, status_or_method, cause_and_solution)
+        """
         if not video_id:
-            return None
+            return None, "Invalid video ID", "The provided video ID or URL is empty."
 
         if languages is None:
             languages = ["en", "en-US", "en-GB", "en-CA", "en-AU", "auto", "a.en"]
 
-        # 1. Try modern youtube_transcript_api (v1.x instance methods) or legacy (v0.x class methods)
+        failure_reasons = []
+
+        # ==========================================================
+        # Method 1: youtube_transcript_api direct fetch
+        # ==========================================================
         try:
             if not hasattr(YouTubeTranscriptApi, "get_transcript") and hasattr(YouTubeTranscriptApi, "fetch"):
                 api = YouTubeTranscriptApi()
@@ -119,8 +142,9 @@ class TranscriptFetcher:
                         if clean_line:
                             lines.append(clean_line)
                     if lines:
-                        raw = " ".join(lines)
-                        return TranscriptFetcher.clean_voiceover_script(raw)
+                        cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
+                        if cleaned:
+                            return cleaned, "YouTube Official Captions (API Direct)", None
             elif hasattr(YouTubeTranscriptApi, "get_transcript"):
                 transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
                 if transcript_list:
@@ -130,12 +154,22 @@ class TranscriptFetcher:
                         if text:
                             lines.append(text)
                     if lines:
-                        raw = " ".join(lines)
-                        return TranscriptFetcher.clean_voiceover_script(raw)
+                        cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
+                        if cleaned:
+                            return cleaned, "YouTube Official Captions (API Direct)", None
         except Exception as e:
-            logger.debug(f"Direct transcript API failed for {video_id}: {e}")
+            err_msg = str(e)
+            logger.debug(f"Direct transcript API failed for {video_id}: {err_msg}")
+            if "TranscriptsDisabled" in err_msg:
+                failure_reasons.append("Creator explicitly disabled subtitles/transcripts for this video.")
+            elif "NoTranscriptFound" in err_msg:
+                failure_reasons.append("No primary English transcript track found.")
+            else:
+                failure_reasons.append(f"Direct API error: {err_msg[:80]}")
 
-        # 2. Fallback: inspect available transcripts list
+        # ==========================================================
+        # Method 2 & 3: youtube_transcript_api transcript list & auto-translation
+        # ==========================================================
         try:
             if hasattr(YouTubeTranscriptApi, "list_transcripts"):
                 transcript_list_obj = YouTubeTranscriptApi.list_transcripts(video_id)
@@ -145,6 +179,7 @@ class TranscriptFetcher:
             else:
                 transcript_list_obj = []
 
+            # Check manual or generated in requested languages first
             for t in transcript_list_obj:
                 try:
                     data = t.fetch()
@@ -155,14 +190,39 @@ class TranscriptFetcher:
                         if clean_line:
                             lines.append(clean_line)
                     if lines:
-                        raw = " ".join(lines)
-                        return TranscriptFetcher.clean_voiceover_script(raw)
+                        cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
+                        if cleaned:
+                            kind = "Manual" if not getattr(t, "is_generated", False) else "Auto-Generated"
+                            return cleaned, f"YouTube {kind} Captions ({getattr(t, 'language_code', 'en')})", None
                 except Exception:
                     continue
+
+            # Check auto-translate to English if foreign language transcript exists
+            for t in transcript_list_obj:
+                if getattr(t, "is_translatable", False):
+                    try:
+                        translated_t = t.translate("en")
+                        data = translated_t.fetch()
+                        lines = []
+                        for item in data:
+                            text = getattr(item, "text", None) or (item.get("text", "") if isinstance(item, dict) else str(item))
+                            clean_line = text.strip()
+                            if clean_line:
+                                lines.append(clean_line)
+                        if lines:
+                            cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
+                            if cleaned:
+                                orig_lang = getattr(t, "language", "Original Language")
+                                return cleaned, f"Translated Captions (from {orig_lang} to English)", None
+                    except Exception as e:
+                        logger.debug(f"Translation failed for {video_id}: {e}")
+
         except Exception as e:
             logger.debug(f"Transcript list inspection failed for {video_id}: {e}")
 
-        # 3. Fallback: yt-dlp automatic captions / subtitles extraction
+        # ==========================================================
+        # Method 4: yt-dlp Subtitle & Auto-Captions Extraction
+        # ==========================================================
         try:
             import yt_dlp
             ydl_opts = {
@@ -173,31 +233,43 @@ class TranscriptFetcher:
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-                sub_tracks = info.get("subtitles") or info.get("automatic_captions") or {}
+                sub_tracks = info.get("subtitles") or {}
+                auto_tracks = info.get("automatic_captions") or {}
 
-                en_track = None
-                for lang_key in ["en", "en-US", "en-GB", "en-orig"]:
-                    if lang_key in sub_tracks:
-                        en_track = sub_tracks[lang_key]
+                # Check manual subtitles first, then automatic captions
+                combined_tracks = dict(sub_tracks)
+                for k, v in auto_tracks.items():
+                    if k not in combined_tracks:
+                        combined_tracks[k] = v
+
+                chosen_track = None
+                chosen_lang = ""
+                # Priority: English codes, then any track
+                for lang_key in ["en", "en-US", "en-GB", "en-orig", "en-CA", "en-IN", "en-AU"]:
+                    if lang_key in combined_tracks:
+                        chosen_track = combined_tracks[lang_key]
+                        chosen_lang = lang_key
                         break
-                if not en_track and sub_tracks:
-                    en_track = next(iter(sub_tracks.values()))
 
-                if en_track:
+                if not chosen_track and combined_tracks:
+                    chosen_lang, chosen_track = next(iter(combined_tracks.items()))
+
+                if chosen_track:
                     sub_url = None
-                    for fmt in en_track:
+                    for fmt in chosen_track:
                         if fmt.get("ext") in ("json3", "vtt", "srv1", "ttml"):
                             sub_url = fmt.get("url")
                             break
-                    if not sub_url and en_track:
-                        sub_url = en_track[0].get("url")
+                    if not sub_url:
+                        sub_url = chosen_track[0].get("url")
 
                     if sub_url:
                         import urllib.request
                         import json
-                        req = urllib.request.Request(sub_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req, timeout=8) as resp:
+                        req = urllib.request.Request(sub_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                        with urllib.request.urlopen(req, timeout=10) as resp:
                             raw_data = resp.read()
+                            # Try parsing as JSON3 timedtext
                             try:
                                 parsed = json.loads(raw_data.decode("utf-8"))
                                 events = parsed.get("events", [])
@@ -208,20 +280,86 @@ class TranscriptFetcher:
                                         if t_seg and t_seg != "\n":
                                             lines.append(t_seg)
                                 if lines:
-                                    raw = " ".join(lines)
-                                    return TranscriptFetcher.clean_voiceover_script(raw)
+                                    cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
+                                    if cleaned:
+                                        return cleaned, f"yt-dlp Captions ({chosen_lang})", None
                             except Exception:
-                                decoded = raw_data.decode("utf-8", errors="ignore")
-                                cleaned = re.sub(r"<[^>]+>", "", decoded)
-                                cleaned = re.sub(r"\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}", "", cleaned)
-                                lines = [l.strip() for l in cleaned.splitlines() if l.strip() and not l.strip().isdigit() and not l.startswith("WEBVTT")]
-                                if lines:
-                                    raw = " ".join(lines)
-                                    return TranscriptFetcher.clean_voiceover_script(raw)
+                                pass
+
+                            # Try parsing as WEBVTT / XML text
+                            decoded = raw_data.decode("utf-8", errors="ignore")
+                            cleaned_xml = re.sub(r"<[^>]+>", "", decoded)
+                            cleaned_vtt = re.sub(r"\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}", "", cleaned_xml)
+                            lines = [
+                                l.strip() for l in cleaned_vtt.splitlines()
+                                if l.strip() and not l.strip().isdigit() and not l.startswith("WEBVTT") and not l.startswith("NOTE")
+                            ]
+                            if lines:
+                                cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
+                                if cleaned:
+                                    return cleaned, f"yt-dlp Subtitle Stream ({chosen_lang})", None
         except Exception as e:
             logger.debug(f"yt-dlp fallback transcript fetch failed for {video_id}: {e}")
 
-        return None
+        # ==========================================================
+        # Method 5: Direct YouTube Web Player TimedText Discovery
+        # ==========================================================
+        try:
+            import urllib.request
+            import json
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            req = urllib.request.Request(video_url, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+
+            # Look for captionTracks JSON in ytInitialPlayerResponse
+            match = re.search(r'"captionTracks":\s*(\[.*?\])', html)
+            if match:
+                tracks_json = json.loads(match.group(1))
+                if tracks_json:
+                    base_url = tracks_json[0].get("baseUrl")
+                    if base_url:
+                        # Append fmt=json3 for structured output
+                        if "fmt=" not in base_url:
+                            base_url += "&fmt=json3"
+                        sub_req = urllib.request.Request(base_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(sub_req, timeout=10) as sub_resp:
+                            sub_content = sub_resp.read().decode("utf-8", errors="ignore")
+                            try:
+                                sub_obj = json.loads(sub_content)
+                                lines = []
+                                for ev in sub_obj.get("events", []):
+                                    for seg in ev.get("segs", []):
+                                        t_seg = seg.get("utf8", "").strip()
+                                        if t_seg and t_seg != "\n":
+                                            lines.append(t_seg)
+                                if lines:
+                                    cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
+                                    if cleaned:
+                                        return cleaned, "YouTube Web Player TimedText", None
+                            except Exception:
+                                pass
+        except Exception as e:
+            logger.debug(f"Direct web timedtext discovery failed for {video_id}: {e}")
+
+        # ==========================================================
+        # All 5 Discovery Methods Failed - Build Diagnostic Info
+        # ==========================================================
+        cause = (
+            "YouTube reports no subtitles or automated closed captions (CC) exist for this video. "
+            "Possible reasons: Creator has closed captions disabled, the video contains no detectable speech / audio-only music, "
+            "or automatic speech recognition has not finished processing for this upload."
+        )
+        solution = (
+            "1. Verify if the video displays a 'CC' button when watched directly on YouTube in your web browser.\n"
+            "2. If this is a newly uploaded video, YouTube's auto-caption processing may take 1-2 hours to become available.\n"
+            "3. If the video is speech-heavy and CC is enabled, ensure your IP is not temporarily rate-limited by YouTube."
+        )
+
+        return None, "Not Available on YouTube", f"{cause}\n\nSuggested Action:\n{solution}"
 
 
     @staticmethod

@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "Multi Downloader"
-APP_VERSION = "2.8.0"
+APP_VERSION = "3.0.0"
 ORGANIZATION = "Antigravity Engineering"
 
 
@@ -61,11 +61,11 @@ DEFAULT_MAX_RETRIES = 3
 SEGMENT_CONNECTIONS_OPTIONS = ("AUTO", "1", "2", "4", "8", "16", "32")
 DEFAULT_SEGMENT_CONNECTIONS = "AUTO"
 
-CHANNEL_FETCH_RANGES = (10, 25, 50, 75, 100, 250, 500)
+CHANNEL_FETCH_RANGES = (25, 50, 75, 100, 150, 200, 300, 500, 1000, "All (Unlimited)")
 DEFAULT_CHANNEL_FETCH_COUNT = 50
 
-ORDER_LATEST_TO_OLDEST = "Latest → Oldest (New to Old: V1=Newest)"
-ORDER_OLDEST_TO_LATEST = "Oldest → Latest"
+ORDER_LATEST_TO_OLDEST = "Newest to Oldest"
+ORDER_OLDEST_TO_LATEST = "Oldest to Newest"
 CHANNEL_ORDER_OPTIONS = (ORDER_LATEST_TO_OLDEST, ORDER_OLDEST_TO_LATEST)
 
 AUDIO_FORMATS = ("MP3", "M4A", "WAV", "FLAC", "OPUS", "AAC")
@@ -78,7 +78,7 @@ AUDIO_QUALITIES = (
     "320 kbps (Maximum - ~144MB/hr)",
     "Best Available",
 )
-DEFAULT_AUDIO_QUALITY = "128 kbps (Recommended - ~55MB/hr)"
+DEFAULT_AUDIO_QUALITY = "192 kbps (High Quality - ~86MB/hr)"
 
 AUDIO_SAMPLE_RATES = ("Auto", "44100 Hz", "48000 Hz")
 AUDIO_CHANNELS = ("Auto", "Stereo", "Mono")
@@ -87,13 +87,14 @@ VIDEO_QUALITIES = (
     "Best Available",
     "2160p (4K)",
     "1440p (2K)",
-    "1080p (FHD)",
+    "1080p (Full HD)",
     "720p (HD)",
     "480p (SD)",
-    "360p",
-    "240p",
+    "360p (Low)",
 )
+DEFAULT_VIDEO_QUALITY = "1080p (Full HD)"
 VIDEO_FORMATS = ("MP4", "MKV", "WEBM")
+DEFAULT_VIDEO_FORMAT = "MP4"
 VIDEO_FPS_OPTIONS = ("Best Available", "60", "50", "30", "25", "24")
 VIDEO_CODECS = ("Auto", "H.264", "H.265/HEVC", "VP9", "AV1")
 

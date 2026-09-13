@@ -77,7 +77,13 @@ class SpeedOptimizer:
         return None
 
     @classmethod
-    def build_speed_options(cls, settings: Optional[Settings] = None, is_audio: bool = True) -> Dict[str, Any]:
+    def build_speed_options(
+        cls,
+        settings: Optional[Settings] = None,
+        is_audio: bool = True,
+        quality: Optional[str] = None,
+        format_ext: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Builds a comprehensive dictionary of yt-dlp speed-limit bypass options.
         """
@@ -150,11 +156,48 @@ class SpeedOptimizer:
         if extractor_args:
             opts["extractor_args"] = extractor_args
 
+        # Configure FFmpeg location
+        try:
+            from app.downloader.ffmpeg_engine import FFmpegEngine
+            ffmpeg_bin = FFmpegEngine.get_ffmpeg_path()
+            if ffmpeg_bin and ffmpeg_bin != "ffmpeg":
+                opts["ffmpeg_location"] = ffmpeg_bin
+        except Exception:
+            pass
+
         # Format selector
         if is_audio:
             opts["format"] = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
         else:
-            opts["format"] = "bestvideo+bestaudio/best"
+            # Resolution height mapping
+            height_limit = None
+            q_str = str(quality or "").lower()
+            if "2160" in q_str or "4k" in q_str:
+                height_limit = 2160
+            elif "1440" in q_str or "2k" in q_str:
+                height_limit = 1440
+            elif "1080" in q_str or "fhd" in q_str or "full hd" in q_str:
+                height_limit = 1080
+            elif "720" in q_str or "hd" in q_str:
+                height_limit = 720
+            elif "480" in q_str or "sd" in q_str:
+                height_limit = 480
+            elif "360" in q_str:
+                height_limit = 360
+            elif "240" in q_str:
+                height_limit = 240
+
+            f_ext = (format_ext or "mp4").lower()
+            if height_limit:
+                opts["format"] = (
+                    f"bestvideo[height<={height_limit}][ext={f_ext}]+bestaudio[ext=m4a]/"
+                    f"bestvideo[height<={height_limit}]+bestaudio/"
+                    f"best[height<={height_limit}]/best"
+                )
+            else:
+                opts["format"] = f"bestvideo[ext={f_ext}]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+
+            opts["merge_output_format"] = f_ext
 
         return opts
 

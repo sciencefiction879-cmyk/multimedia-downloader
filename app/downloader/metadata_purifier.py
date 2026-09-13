@@ -262,3 +262,119 @@ class MetadataPurifier:
 
         logger.info(f"Exported {len(saved_files)} purified metadata files to {output_dir}")
         return saved_files
+
+    @classmethod
+    def export_tags_to_folder(
+        cls,
+        candidates: List[Any],
+        metadata_dict: Dict[str, Dict[str, Any]],
+        output_dir: Path,
+        channel_name: str = "",
+    ) -> List[Path]:
+        """
+        Saves purified tags for each video:
+        - V1 Tags.txt
+        - V2 Tags.txt...
+        and a master all_tags.txt in the output_dir.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_files: List[Path] = []
+        all_unique_tags: List[str] = []
+        seen_tags = set()
+
+        for idx, cand in enumerate(candidates, start=1):
+            vid_id = getattr(cand, "video_id", None) or (cand.get("video_id") if isinstance(cand, dict) else "")
+            v_label = getattr(cand, "version_label", None) or (cand.get("version_label", f"V{idx}") if isinstance(cand, dict) else f"V{idx}")
+            title = getattr(cand, "title", f"Video {idx}")
+            c_name = getattr(cand, "uploader", None) or channel_name
+
+            info = metadata_dict.get(vid_id) or {}
+            raw_tags = info.get("tags") or []
+            clean_tags = cls.purify_tags(raw_tags, channel_name=c_name)
+
+            for t in clean_tags:
+                tl = t.lower()
+                if tl not in seen_tags:
+                    seen_tags.add(tl)
+                    all_unique_tags.append(t)
+
+            tag_lines = [f"=== {v_label} TAGS ===", f"Video: {v_label}. {title}", f"Total Tags: {len(clean_tags)}", ""]
+            if clean_tags:
+                tag_lines.append("--- Tag List ---")
+                tag_lines.extend(clean_tags)
+                tag_lines.append("")
+                tag_lines.append("--- Comma-Separated Format (Ready for YouTube Studio) ---")
+                tag_lines.append(", ".join(clean_tags))
+            else:
+                tag_lines.append("[No tags found for this video]")
+
+            tag_file = output_dir / f"{v_label} Tags.txt"
+            with open(tag_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(tag_lines) + "\n")
+            saved_files.append(tag_file)
+
+        # Master all_tags.txt
+        all_tags_file = output_dir / "all_tags.txt"
+        with open(all_tags_file, "w", encoding="utf-8") as f:
+            f.write(f"=== ALL UNIQUE TAGS ({len(all_unique_tags)} Total) ===\n\n")
+            f.write(", ".join(all_unique_tags) + "\n\n")
+            f.write("--- List Format ---\n")
+            for t in all_unique_tags:
+                f.write(f"{t}\n")
+        saved_files.append(all_tags_file)
+
+        logger.info(f"Exported {len(saved_files)} tag files to {output_dir}")
+        return saved_files
+
+    @classmethod
+    def export_descriptions_to_folder(
+        cls,
+        candidates: List[Any],
+        metadata_dict: Dict[str, Dict[str, Any]],
+        output_dir: Path,
+        channel_name: str = "",
+        channel_url: str = "",
+    ) -> List[Path]:
+        """
+        Saves purified descriptions for each video:
+        - V1 Description.txt
+        - V2 Description.txt...
+        into output_dir.
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        saved_files: List[Path] = []
+        for idx, cand in enumerate(candidates, start=1):
+            vid_id = getattr(cand, "video_id", None) or (cand.get("video_id") if isinstance(cand, dict) else "")
+            v_label = getattr(cand, "version_label", None) or (cand.get("version_label", f"V{idx}") if isinstance(cand, dict) else f"V{idx}")
+            title = getattr(cand, "title", f"Video {idx}")
+            c_name = getattr(cand, "uploader", None) or channel_name
+            c_url = getattr(cand, "channel_url", None) or channel_url
+
+            info = metadata_dict.get(vid_id) or {}
+            raw_desc = info.get("description") or ""
+            clean_desc = cls.purify_description(raw_desc, channel_name=c_name, channel_url=c_url)
+            word_count = len(clean_desc.split()) if clean_desc else 0
+
+            lines = [
+                f"=== {v_label} DESCRIPTION ===",
+                f"Competitor Channel Name: {c_name}" if c_name else "",
+                f"Competitor Channel Link: {c_url}" if c_url else "",
+                f"Video: {v_label}. {title}",
+                f"Word Count: {word_count:,}",
+                "",
+                clean_desc if clean_desc else (raw_desc if raw_desc else "[No description text available]"),
+                "",
+            ]
+            lines = [l for l in lines if l is not None]
+
+            desc_file = output_dir / f"{v_label} Description.txt"
+            with open(desc_file, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            saved_files.append(desc_file)
+
+        logger.info(f"Exported {len(saved_files)} description files to {output_dir}")
+        return saved_files

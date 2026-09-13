@@ -83,7 +83,12 @@ class DownloadWorker(QThread):
                     self.status_signal.emit(self.item, "Processing media...")
 
             # Build high-speed yt-dlp options from SpeedOptimizer
-            ydl_opts = SpeedOptimizer.build_speed_options(settings=self.settings, is_audio=is_audio)
+            ydl_opts = SpeedOptimizer.build_speed_options(
+                settings=self.settings,
+                is_audio=is_audio,
+                quality=self.item.quality,
+                format_ext=self.item.format_ext,
+            )
             ydl_opts["outtmpl"] = temp_template
             ydl_opts["progress_hooks"] = [_progress_hook]
 

@@ -57,6 +57,7 @@ rm -rf "$DIR/build" "$DIR/dist"
     --hidden-import="app.downloader.speed_optimizer" \
     --hidden-import="app.downloader.metadata_purifier" \
     --hidden-import="app.downloader.channel_assets_fetcher" \
+    --hidden-import="app.utils.range_parser" \
     --noconfirm \
     --clean \
     main.py
@@ -101,11 +102,11 @@ if [ ! -f "$DMG_PATH" ]; then
     hdiutil create -volname "MultiDownloader" -srcfolder "$DIR/dist/MultiDownloader.app" -ov -format UDZO "$DMG_PATH"
 fi
 
-cp -f "$DMG_PATH" "$DIR/dist/MultiDownloader-v2.8.0.dmg"
+cp -f "$DMG_PATH" "$DIR/dist/MultiDownloader-v3.0.0.dmg"
 
 echo "=========================================="
 echo " Build Success!"
 echo " App: dist/MultiDownloader.app"
 echo " DMG: dist/MultiDownloader.dmg"
-echo " DMG: dist/MultiDownloader-v2.8.0.dmg"
+echo " DMG: dist/MultiDownloader-v3.0.0.dmg"
 echo "=========================================="

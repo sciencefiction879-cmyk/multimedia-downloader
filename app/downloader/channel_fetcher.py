@@ -25,6 +25,7 @@ class ChannelCandidate:
     is_selected: bool = True
     version_label: str = "V1"
     version_num: int = 1
+    original_index: int = 0
     custom_title: Optional[str] = None
     match_score: float = 100.0
 
@@ -64,6 +65,7 @@ class ChannelCandidate:
             thumbnail=thumb,
             version_label=f"V{index}",
             version_num=index,
+            original_index=index,
         )
 
 
@@ -86,12 +88,15 @@ class ChannelFetcher:
     def fetch_channel_videos(
         self,
         url: str,
-        max_results: int = 50,
+        max_results: Optional[int] = 50,
         order: str = ORDER_LATEST_TO_OLDEST,
     ) -> List[ChannelCandidate]:
         logger.info(f"Fetching channel/playlist videos from: {url} (max: {max_results}, order: {order})")
         opts = dict(self.ydl_opts)
-        opts["playlistend"] = max_results
+        if max_results is not None and int(max_results) > 0:
+            opts["playlistend"] = int(max_results)
+        else:
+            opts.pop("playlistend", None)
 
         # Reset channel info
         self.channel_name = ""
@@ -151,9 +156,10 @@ class ChannelFetcher:
             entries = [info]
 
         candidates = []
-        for raw_entry in entries:
+        for orig_idx, raw_entry in enumerate(entries, start=1):
             cand = ChannelCandidate.from_dict(
                 raw_entry,
+                index=orig_idx,
                 parent_channel=self.channel_name,
                 parent_channel_url=self.channel_url,
             )
@@ -161,15 +167,24 @@ class ChannelFetcher:
                 candidates.append(cand)
 
         # Apply sorting:
-        # ORDER_LATEST_TO_OLDEST (New to Old) is default:
-        # YouTube returns newest first in /videos tab.
-        # If user chooses Oldest -> Latest, reverse list.
-        if order == ORDER_OLDEST_TO_LATEST:
-            candidates.reverse()
-
-        # Assign version labels V1, V2, V3... in exact order
-        self.reassign_version_labels(candidates)
+        self.sort_candidates(candidates, order=order)
         logger.info(f"Successfully loaded {len(candidates)} video candidates with V1..V{len(candidates)} sequencing.")
+        return candidates
+
+    @staticmethod
+    def sort_candidates(candidates: List[ChannelCandidate], order: str = ORDER_LATEST_TO_OLDEST) -> List[ChannelCandidate]:
+        """
+        Sorts candidates by chronological order:
+        - ORDER_LATEST_TO_OLDEST (Newest to Oldest): original YouTube /videos sequence (index 1 is newest).
+        - ORDER_OLDEST_TO_LATEST (Oldest to Newest): reversed sequence (index 1 is oldest).
+        Then dynamically updates V1, V2, V3... numbering.
+        """
+        if order == ORDER_OLDEST_TO_LATEST:
+            candidates.sort(key=lambda c: c.original_index, reverse=True)
+        else:
+            candidates.sort(key=lambda c: c.original_index, reverse=False)
+
+        ChannelFetcher.reassign_version_labels(candidates)
         return candidates
 
     @staticmethod
