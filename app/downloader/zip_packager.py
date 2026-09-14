@@ -61,6 +61,52 @@ class ZipPackager:
         return output_file
 
     @classmethod
+    def export_single_titles_file(
+        cls,
+        candidates: List[Any],
+        output_file: Path,
+        channel_name: str = "",
+        channel_url: str = "",
+    ) -> Path:
+        """
+        Saves all titles into one single TXT file (Titles.txt) in the main folder.
+        Format:
+        V1 — Title of video 1
+        V2 — Title of video 2
+        V3 — Title of video 3
+        etc.
+        """
+        output_file = Path(output_file)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        if not channel_name and candidates:
+            first = candidates[0]
+            channel_name = getattr(first, "uploader", None) or (first.get("uploader") if isinstance(first, dict) else "")
+        if not channel_url and candidates:
+            first = candidates[0]
+            channel_url = getattr(first, "channel_url", None) or (first.get("channel_url") if isinstance(first, dict) else "")
+
+        lines = []
+        if channel_name:
+            lines.append(f"Channel: {channel_name}")
+        if channel_url:
+            lines.append(f"URL: {channel_url}")
+        lines.append(f"Total Videos: {len(candidates)}")
+        lines.append("-" * 50)
+        lines.append("")
+
+        for idx, cand in enumerate(candidates, start=1):
+            title = getattr(cand, "title", None) or (cand.get("title", f"Video {idx}") if isinstance(cand, dict) else f"Video {idx}")
+            v_label = getattr(cand, "version_label", None) or (cand.get("version_label", f"V{idx}") if isinstance(cand, dict) else f"V{idx}")
+            lines.append(f"{v_label} — {title}")
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        logger.info(f"Saved single titles file: {output_file} ({len(candidates)} titles)")
+        return output_file
+
+    @classmethod
     def export_titles_folder(
         cls,
         candidates: List[Any],

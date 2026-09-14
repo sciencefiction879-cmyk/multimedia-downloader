@@ -60,6 +60,21 @@ class DownloadWorker(QThread):
             out_dir.mkdir(parents=True, exist_ok=True)
 
             is_audio = self.item.media_type.lower() == "audio"
+            target_ext = (self.item.format_ext or ("MP3" if is_audio else "MP4")).lower()
+            base_name = self.item.version_label if self.item.version_label else (sanitize_filename(self.item.title) if self.item.title else f"media_{self.item.id[:8]}")
+            expected_final_path = out_dir / f"{base_name}.{target_ext}"
+
+            # Resume check: if already completed on disk, skip instantly!
+            if expected_final_path.exists() and expected_final_path.stat().st_size > 10240:
+                logger.info(f"File already downloaded on disk (Resumed): {expected_final_path}")
+                self.item.output_filepath = str(expected_final_path)
+                self.item.status = DownloadStatus.COMPLETED
+                self.item.progress_percent = 100.0
+                self.item.downloaded_bytes = expected_final_path.stat().st_size
+                self.item.total_bytes = expected_final_path.stat().st_size
+                self.status_signal.emit(self.item, "Already downloaded (Skipped)")
+                self.finished_signal.emit(self.item)
+                return
 
             # Clean and deterministic temporary filename template
             temp_template = str(out_dir / f"temp_{self.item.id}.%(ext)s")

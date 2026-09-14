@@ -50,6 +50,11 @@ class ChannelAssetsFetcher:
         output_dir.mkdir(parents=True, exist_ok=True)
         out_file = output_dir / f"{version_label} Thumbnail.jpg"
 
+        # Check if already downloaded on disk (Resume capability)
+        if out_file.exists() and out_file.stat().st_size > 1024:
+            logger.debug(f"Thumbnail already exists on disk (Resumed): {out_file}")
+            return out_file
+
         # Sequential quality cascade
         urls_to_try = [
             f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",

@@ -217,6 +217,137 @@ def test_consistent_v_numbering_across_all_assets():
         print("✓ Metadata, Tags, and Descriptions V47..V52 verified!")
 
 
+def test_single_titles_file():
+    print("Testing single Titles.txt file generation...")
+    with tempfile.TemporaryDirectory() as tmp_dir_str:
+        base_dir = Path(tmp_dir_str)
+        channel_name = "TechCompetitor"
+        channel_url = "https://www.youtube.com/@TechCompetitor"
+
+        candidates = [
+            ChannelCandidate(
+                video_id=f"id_{i}",
+                url=f"https://www.youtube.com/watch?v=id_{i}",
+                title=f"Title of video {i}",
+                uploader=channel_name,
+                channel_url=channel_url,
+                version_label=f"V{i}",
+                version_num=i,
+                is_selected=True,
+            )
+            for i in range(1, 6)
+        ]
+
+        out_file = base_dir / "Titles.txt"
+        saved = ZipPackager.export_single_titles_file(
+            candidates=candidates,
+            output_file=out_file,
+            channel_name=channel_name,
+            channel_url=channel_url,
+        )
+
+        assert saved == out_file
+        assert out_file.exists(), "Titles.txt was not created!"
+        content = out_file.read_text(encoding="utf-8")
+
+        # Verify header
+        assert f"Channel: {channel_name}" in content
+        assert f"URL: {channel_url}" in content
+        assert "Total Videos: 5" in content
+
+        # Verify exact required format: V1 — Title of video 1, V2 — Title of video 2...
+        for i in range(1, 6):
+            expected_line = f"V{i} — Title of video {i}"
+            assert expected_line in content, f"Missing '{expected_line}' in Titles.txt"
+
+        # Verify no individual files were created in base_dir
+        txt_files = list(base_dir.glob("*.txt"))
+        assert len(txt_files) == 1, f"Expected exactly 1 TXT file, found {len(txt_files)}"
+        assert txt_files[0].name == "Titles.txt"
+
+        print("✓ Single Titles.txt verified!")
+
+
+def test_resume_disk_skipping():
+    print("Testing disk resume detection and skipping...")
+    from app.downloader.worker import DownloadWorker
+    from app.models.download_item import DownloadItem, DownloadStatus
+    from PySide6.QtCore import QCoreApplication
+    import sys
+
+    # Ensure QCoreApplication exists for worker signals
+    app = QCoreApplication.instance()
+    if not app:
+        app = QCoreApplication(sys.argv)
+
+    with tempfile.TemporaryDirectory() as tmp_dir_str:
+        base_dir = Path(tmp_dir_str)
+        v_dir = base_dir / "Videos"
+        v_dir.mkdir(parents=True, exist_ok=True)
+        a_dir = base_dir / "Audio"
+        a_dir.mkdir(parents=True, exist_ok=True)
+        t_dir = base_dir / "Thumbnails"
+        t_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Test Video Resume: create pre-existing video file (> 10KB)
+        existing_video = v_dir / "V1.mp4"
+        existing_video.write_bytes(b"0" * 20000)  # 20 KB
+
+        item_video = DownloadItem(
+            url="https://www.youtube.com/watch?v=dummy_v1",
+            media_type="Video",
+            quality="1080p",
+            format_ext="MP4",
+            custom_output_dir=str(v_dir),
+            version_label="V1",
+            title="Dummy Video 1",
+        )
+
+        worker = DownloadWorker(item_video)
+        worker.run()
+
+        assert item_video.status == DownloadStatus.COMPLETED
+        assert item_video.progress_percent == 100.0
+        assert item_video.output_filepath == str(existing_video)
+        print("✓ Video resume skip verified!")
+
+        # 2. Test Audio Resume: create pre-existing audio file (> 10KB)
+        existing_audio = a_dir / "V2.mp3"
+        existing_audio.write_bytes(b"0" * 15000)  # 15 KB
+
+        item_audio = DownloadItem(
+            url="https://www.youtube.com/watch?v=dummy_v2",
+            media_type="Audio",
+            quality="320 kbps",
+            format_ext="MP3",
+            custom_output_dir=str(a_dir),
+            version_label="V2",
+            title="Dummy Audio 2",
+        )
+
+        worker_a = DownloadWorker(item_audio)
+        worker_a.run()
+
+        assert item_audio.status == DownloadStatus.COMPLETED
+        assert item_audio.progress_percent == 100.0
+        assert item_audio.output_filepath == str(existing_audio)
+        print("✓ Audio resume skip verified!")
+
+        # 3. Test Thumbnail Resume: create pre-existing thumbnail (> 1024 bytes)
+        existing_thumb = t_dir / "V3 Thumbnail.jpg"
+        existing_thumb.write_bytes(b"0" * 2048)  # 2 KB
+
+        thumb_res = ChannelAssetsFetcher.download_thumbnail_for_video(
+            video_id="dummy_v3",
+            version_label="V3",
+            output_dir=t_dir,
+        )
+        assert thumb_res == existing_thumb
+        # Verify it didn't overwrite or make a network call
+        assert existing_thumb.stat().st_size == 2048
+        print("✓ Thumbnail resume skip verified!")
+
+
 def run_all_tests():
     print("==================================================")
     print(" Running MultiDownloader Pro v3.1 Test Suite")
@@ -226,6 +357,8 @@ def run_all_tests():
     test_fetch_query_parser()
     test_format_set()
     test_consistent_v_numbering_across_all_assets()
+    test_single_titles_file()
+    test_resume_disk_skipping()
     print("==================================================")
     print(" ALL V3.1 TESTS PASSED SUCCESSFULLY!")
     print("==================================================")

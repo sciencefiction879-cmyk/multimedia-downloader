@@ -152,6 +152,7 @@ class MediaFetchThread(QThread):
 
 class BatchTranscriptThread(QThread):
     progress_signal = Signal(int, int, str)  # current, total, current_title
+    item_progress = Signal(int, int, int, int, str, str)  # cur, tot, done_count, skip_count, v_label, title
     item_fetched = Signal(str, str)  # video_id, transcript_text
     item_diagnostics = Signal(str, str, str)  # video_id, status_or_method, cause_or_solution
     all_finished = Signal(bool)  # is_completed (True) or cancelled (False)
@@ -173,42 +174,76 @@ class BatchTranscriptThread(QThread):
 
     def run(self):
         total = len(self.candidates)
+        done_count = 0
+        skip_count = 0
+
         for idx, cand in enumerate(self.candidates, start=1):
             if self._is_cancelled:
                 self.all_finished.emit(False)
                 return
 
+            v_label = cand.version_label or f"V{idx}"
+            title = cand.title or f"Video {idx}"
+
             # 1. Check if already fetched in memory
             if cand.video_id in self.existing_transcripts and self.existing_transcripts[cand.video_id]:
-                self.progress_signal.emit(idx, total, f"(Resumed) {cand.title}")
+                skip_count += 1
+                self.progress_signal.emit(idx, total, f"[{v_label}] (Resumed) {title}")
+                self.item_progress.emit(idx, total, done_count, skip_count, v_label, title)
                 self.item_fetched.emit(cand.video_id, self.existing_transcripts[cand.video_id])
+                if self.output_dir:
+                    disk_file = self.output_dir / f"{v_label} Script.txt"
+                    if not disk_file.exists() or disk_file.stat().st_size == 0:
+                        try:
+                            self.output_dir.mkdir(parents=True, exist_ok=True)
+                            formatted = TranscriptFetcher.format_script_with_metadata(
+                                self.existing_transcripts[cand.video_id], v_label
+                            )
+                            disk_file.write_text(formatted, encoding="utf-8")
+                        except Exception:
+                            pass
                 continue
 
-            # 2. Check if already saved on disk
+            # 2. Check if already saved on disk (Resume from disk)
             if self.output_dir:
-                disk_file = self.output_dir / f"{cand.version_label} Script.txt"
+                disk_file = self.output_dir / f"{v_label} Script.txt"
                 if disk_file.exists() and disk_file.stat().st_size > 0:
                     try:
                         with open(disk_file, "r", encoding="utf-8") as f:
                             saved_text = f.read()
                         if saved_text and not saved_text.startswith("[No transcript"):
-                            self.progress_signal.emit(idx, total, f"(Saved on disk) {cand.title}")
+                            skip_count += 1
+                            self.progress_signal.emit(idx, total, f"[{v_label}] (Already on disk - Skipped) {title}")
+                            self.item_progress.emit(idx, total, done_count, skip_count, v_label, title)
                             self.item_fetched.emit(cand.video_id, saved_text)
                             continue
                     except Exception:
                         pass
 
-            self.progress_signal.emit(idx, total, cand.title)
+            self.progress_signal.emit(idx, total, f"[{v_label}] Downloading: {title}")
             try:
                 text, method, diag = TranscriptFetcher.fetch_video_transcript_with_diagnostics(cand.video_id)
                 if text:
+                    done_count += 1
                     self.item_fetched.emit(cand.video_id, text)
                     self.item_diagnostics.emit(cand.video_id, method, "")
+                    # Live Saving immediately to disk as each item is retrieved
+                    if self.output_dir:
+                        try:
+                            self.output_dir.mkdir(parents=True, exist_ok=True)
+                            disk_file = self.output_dir / f"{v_label} Script.txt"
+                            formatted = TranscriptFetcher.format_script_with_metadata(text, v_label)
+                            with open(disk_file, "w", encoding="utf-8") as f:
+                                f.write(formatted)
+                        except Exception as e:
+                            logger.debug(f"Live script save failed for {v_label}: {e}")
                 else:
                     self.item_diagnostics.emit(cand.video_id, method, diag or "")
             except Exception as e:
                 logger.debug(f"Transcript fetch error for {cand.video_id}: {e}")
                 self.item_diagnostics.emit(cand.video_id, "Error", str(e))
+
+            self.item_progress.emit(idx, total, done_count, skip_count, v_label, title)
 
         if not self._is_cancelled:
             self.all_finished.emit(True)
@@ -274,6 +309,7 @@ class BatchMetadataThread(QThread):
 
 class BatchThumbnailThread(QThread):
     progress_signal = Signal(int, int, str)
+    item_progress = Signal(int, int, int, int, str, str)  # cur, tot, done_count, skip_count, v_label, title
     all_finished = Signal(bool, list)
 
     def __init__(self, candidates: List[ChannelCandidate], output_dir: Path):
@@ -286,12 +322,39 @@ class BatchThumbnailThread(QThread):
         self._is_cancelled = True
 
     def run(self):
-        saved = ChannelAssetsFetcher.download_all_thumbnails(
-            candidates=self.candidates,
-            output_dir=self.output_dir,
-            progress_callback=lambda cur, tot, title: self.progress_signal.emit(cur, tot, title),
-            is_cancelled=lambda: self._is_cancelled,
-        )
+        output_dir = Path(self.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        saved = []
+        total = len(self.candidates)
+        done_count = 0
+        skip_count = 0
+
+        for idx, cand in enumerate(self.candidates, start=1):
+            if self._is_cancelled:
+                self.all_finished.emit(False, saved)
+                return
+
+            v_label = cand.version_label or f"V{idx}"
+            title = cand.title or f"Video {idx}"
+            out_file = output_dir / f"{v_label} Thumbnail.jpg"
+
+            if out_file.exists() and out_file.stat().st_size > 1024:
+                skip_count += 1
+                saved.append(out_file)
+            else:
+                saved_path = ChannelAssetsFetcher.download_thumbnail_for_video(
+                    video_id=cand.video_id,
+                    version_label=v_label,
+                    output_dir=output_dir,
+                    fallback_thumb_url=cand.thumbnail,
+                )
+                if saved_path:
+                    saved.append(saved_path)
+                    done_count += 1
+
+            self.progress_signal.emit(idx, total, f"[{v_label}] {title}")
+            self.item_progress.emit(idx, total, done_count, skip_count, v_label, title)
+
         self.all_finished.emit(not self._is_cancelled, saved)
 
 
@@ -435,58 +498,43 @@ class ChannelView(QWidget):
         lbl_sel_info.setStyleSheet("color: #007aff; font-weight: 600;")
         sel_layout.addWidget(lbl_sel_info)
 
-        # 9 Selection Checkboxes organized in clean grid
+        # 6 Clean Selection Checkboxes organized in grid (Removed: Metadata, Description, Tags)
         grid_sel = QGridLayout()
         grid_sel.setSpacing(10)
 
-        self.chk_titles = QCheckBox("1. Video Title (Formatted TXT in Titles/ folder)")
+        self.chk_titles = QCheckBox("1. Video Titles (Single Titles.txt in root folder)")
         self.chk_titles.setChecked(True)
-        self.chk_titles.setToolTip("Saves each title in Titles/ with Competitor Channel Name & Link at the top")
+        self.chk_titles.setToolTip("Creates only one TXT file named Titles.txt containing V1 — Title, V2 — Title...")
         grid_sel.addWidget(self.chk_titles, 0, 0)
 
-        self.chk_scripts = QCheckBox("2. Script / Transcript (Forced 5-tier discovery cascade in Scripts/)")
+        self.chk_scripts = QCheckBox("2. Script / Transcript (Scripts/ folder: V1 Script.txt...)")
         self.chk_scripts.setChecked(True)
         self.chk_scripts.setToolTip("Active search across manual CC, auto-captions, translations, yt-dlp, and timedtext")
         grid_sel.addWidget(self.chk_scripts, 0, 1)
 
-        self.chk_mp3s = QCheckBox("3. Audio Voiceover (V1.mp3... parallel download)")
-        self.chk_mp3s.setChecked(True)
-        self.chk_mp3s.setToolTip("Parallel MP3 audio downloads named V1.mp3, V2.mp3...")
-        grid_sel.addWidget(self.chk_mp3s, 0, 2)
-
-        self.chk_metadata = QCheckBox("4. Purified Metadata (Cleaned TXT in Metadata/ folder)")
-        self.chk_metadata.setChecked(True)
-        self.chk_metadata.setToolTip("Strips all competitor URLs, promotional links, social media handles, and branding")
-        grid_sel.addWidget(self.chk_metadata, 1, 0)
-
-        self.chk_descriptions = QCheckBox("5. Description (Descriptions/ folder)")
-        self.chk_descriptions.setChecked(True)
-        self.chk_descriptions.setToolTip("Saves full original video descriptions named V1 Description.txt...")
-        grid_sel.addWidget(self.chk_descriptions, 1, 1)
-
-        self.chk_tags = QCheckBox("6. Tags (Tags/ folder + master all_tags.txt)")
-        self.chk_tags.setChecked(True)
-        self.chk_tags.setToolTip("Extracts video keywords into individual TXT files and a combined master list")
-        grid_sel.addWidget(self.chk_tags, 1, 2)
-
-        self.chk_thumbnails = QCheckBox("7. Thumbnails (Sequential V1 Thumbnail.. in Thumbnails/)")
+        self.chk_thumbnails = QCheckBox("3. Thumbnails (Thumbnails/ folder: V1 Thumbnail.jpg...)")
         self.chk_thumbnails.setChecked(True)
         self.chk_thumbnails.setToolTip("Highest resolution thumbnails named V1 Thumbnail.jpg, V2 Thumbnail.jpg...")
-        grid_sel.addWidget(self.chk_thumbnails, 2, 0)
+        grid_sel.addWidget(self.chk_thumbnails, 0, 2)
 
-        self.chk_channel_assets = QCheckBox("8. Channel Assets (Banner & Logo in Channel Assets/)")
-        self.chk_channel_assets.setChecked(True)
-        self.chk_channel_assets.setToolTip("Competitor channel banner and avatar/logo images")
-        grid_sel.addWidget(self.chk_channel_assets, 2, 1)
-
-        self.chk_videos = QCheckBox("9. Video File (Full video in selected resolution & format)")
+        self.chk_videos = QCheckBox("4. Videos (Videos/ folder: V1.mp4...)")
         self.chk_videos.setChecked(False)  # Unchecked by default to save bandwidth unless explicitly wanted
-        self.chk_videos.setToolTip("Downloads actual video file (MP4/MKV) at selected quality (4K, 1080p, 720p...)")
-        grid_sel.addWidget(self.chk_videos, 2, 2)
+        self.chk_videos.setToolTip("Downloads actual video files (MP4) named V1.mp4, V2.mp4... at selected quality")
+        grid_sel.addWidget(self.chk_videos, 1, 0)
+
+        self.chk_mp3s = QCheckBox("5. Audio Voiceover (Audio/ folder: V1.mp3...)")
+        self.chk_mp3s.setChecked(True)
+        self.chk_mp3s.setToolTip("Parallel MP3 audio downloads named V1.mp3, V2.mp3... saved into Audio/ folder")
+        grid_sel.addWidget(self.chk_mp3s, 1, 1)
+
+        self.chk_channel_assets = QCheckBox("6. Channel Assets (Channel Assets/ folder: Banner & Logo)")
+        self.chk_channel_assets.setChecked(True)
+        self.chk_channel_assets.setToolTip("Competitor channel banner and avatar/logo images saved into Channel Assets/")
+        grid_sel.addWidget(self.chk_channel_assets, 1, 2)
 
         sel_layout.addLayout(grid_sel)
 
-        # Selection presets and Launch Button
+        # Selection presets and Launch / Resume Buttons
         bottom_sel_row = QHBoxLayout()
         bottom_sel_row.setSpacing(8)
 
@@ -502,21 +550,29 @@ class ChannelView(QWidget):
         btn_preset_none.clicked.connect(self._preset_deselect_all_data)
         bottom_sel_row.addWidget(btn_preset_none)
 
-        btn_preset_text = QPushButton("Text & Metadata Only")
-        btn_preset_text.clicked.connect(self._preset_text_metadata_data)
-        bottom_sel_row.addWidget(btn_preset_text)
+        btn_preset_scripts = QPushButton("Scripts + Titles")
+        btn_preset_scripts.clicked.connect(self._preset_scripts_titles_data)
+        bottom_sel_row.addWidget(btn_preset_scripts)
 
         btn_preset_media = QPushButton("Media Only")
         btn_preset_media.clicked.connect(self._preset_media_only_data)
         bottom_sel_row.addWidget(btn_preset_media)
 
-        btn_preset_comp = QPushButton("Competitor Package (Default)")
-        btn_preset_comp.clicked.connect(self._preset_competitor_package_data)
-        bottom_sel_row.addWidget(btn_preset_comp)
+        btn_preset_core = QPushButton("Core Package (Default)")
+        btn_preset_core.clicked.connect(self._preset_core_package_data)
+        bottom_sel_row.addWidget(btn_preset_core)
 
         bottom_sel_row.addStretch()
 
-        self.btn_download_selected = QPushButton("🚀 DOWNLOAD SELECTED DATA NOW")
+        self.btn_resume_download = QPushButton("⏯ RESUME DOWNLOAD")
+        self.btn_resume_download.setStyleSheet(
+            "background-color: #ff9500; color: #ffffff; font-weight: 800; font-size: 13px; padding: 8px 16px; border-radius: 6px;"
+        )
+        self.btn_resume_download.setToolTip("Resumes download; automatically checks disk and skips already completed files instantly")
+        self.btn_resume_download.clicked.connect(self._resume_download_clicked)
+        bottom_sel_row.addWidget(self.btn_resume_download)
+
+        self.btn_download_selected = QPushButton("🚀 DOWNLOAD SELECTED DATA")
         self.btn_download_selected.setStyleSheet(
             "background-color: #34c759; color: #ffffff; font-weight: 800; font-size: 13px; padding: 8px 18px; border-radius: 6px;"
         )
@@ -575,27 +631,39 @@ class ChannelView(QWidget):
         # -------------------------------------------------------------
         # 4. Live Download Progress Box (Visible during batch downloads)
         # -------------------------------------------------------------
-        self.box_transcript_progress = QGroupBox("⚡ Download Progress")
+        self.box_transcript_progress = QGroupBox("⚡ Download Progress & Live Status")
         self.box_transcript_progress.setVisible(False)
         prog_layout = QVBoxLayout(self.box_transcript_progress)
         prog_layout.setSpacing(6)
 
         prog_top = QHBoxLayout()
         self.lbl_transcript_status = QLabel("Processing: 0 / 0...")
-        self.lbl_transcript_status.setStyleSheet("font-weight: 600; color: #007aff;")
+        self.lbl_transcript_status.setStyleSheet("font-weight: 700; color: #007aff; font-size: 13px;")
+
+        self.btn_resume_prog = QPushButton("⏯ Resume")
+        self.btn_resume_prog.setStyleSheet("background-color: #ff9500; color: #ffffff; font-weight: 700; padding: 4px 12px; border-radius: 4px;")
+        self.btn_resume_prog.setVisible(False)
+        self.btn_resume_prog.clicked.connect(self._resume_download_clicked)
+
         self.btn_view_diagnostics = QPushButton("ℹ View Diagnostics Report")
         self.btn_view_diagnostics.setVisible(False)
         self.btn_view_diagnostics.clicked.connect(self._show_diagnostics_report)
 
         self.btn_stop_transcripts = QPushButton("⏹ Stop Progress")
-        self.btn_stop_transcripts.setStyleSheet("background-color: #ff3b30; color: #ffffff; font-weight: 600;")
+        self.btn_stop_transcripts.setStyleSheet("background-color: #ff3b30; color: #ffffff; font-weight: 600; padding: 4px 12px; border-radius: 4px;")
         self.btn_stop_transcripts.clicked.connect(self._stop_all_batch_threads)
 
         prog_top.addWidget(self.lbl_transcript_status)
         prog_top.addStretch()
+        prog_top.addWidget(self.btn_resume_prog)
         prog_top.addWidget(self.btn_view_diagnostics)
         prog_top.addWidget(self.btn_stop_transcripts)
         prog_layout.addLayout(prog_top)
+
+        # Detailed metrics label: current item, done, skipped, remaining
+        self.lbl_progress_details = QLabel("Preparing tasks...")
+        self.lbl_progress_details.setStyleSheet("color: #cfd3dc; font-size: 12px;")
+        prog_layout.addWidget(self.lbl_progress_details)
 
         self.bar_transcripts = QProgressBar()
         self.bar_transcripts.setRange(0, 100)
@@ -696,39 +764,39 @@ class ChannelView(QWidget):
         btn_grid = QGridLayout()
         btn_grid.setSpacing(8)
 
-        self.btn_copy_all_titles = QPushButton("📋 1. Copy All Titles (V1. Title...)")
+        self.btn_copy_all_titles = QPushButton("📋 1. Copy All Titles (V1 — Title...)")
         self.btn_copy_all_titles.clicked.connect(self._copy_all_titles_clicked)
         btn_grid.addWidget(self.btn_copy_all_titles, 0, 0)
 
-        self.btn_bulk_titles = QPushButton("📑 2. Download Titles (Titles Folder)")
+        self.btn_bulk_titles = QPushButton("📑 2. Download Titles (Titles.txt)")
         self.btn_bulk_titles.clicked.connect(self._bulk_download_titles)
         btn_grid.addWidget(self.btn_bulk_titles, 0, 1)
 
-        self.btn_bulk_scripts = QPushButton("📄 3. Download All Scripts (V1 Script.txt...)")
+        self.btn_bulk_scripts = QPushButton("📄 3. Download All Scripts (Scripts/ folder)")
         self.btn_bulk_scripts.clicked.connect(self._bulk_download_scripts)
         btn_grid.addWidget(self.btn_bulk_scripts, 1, 0)
 
-        self.btn_bulk_mp3s = QPushButton("🎵 4. Download All MP3s (V1.mp3, V2.mp3...)")
-        self.btn_bulk_mp3s.clicked.connect(self._bulk_download_mp3s)
-        btn_grid.addWidget(self.btn_bulk_mp3s, 1, 1)
-
-        self.btn_bulk_metadata = QPushButton("🏷 5. Download Metadata (V1 Metadata.txt...)")
-        self.btn_bulk_metadata.clicked.connect(self._bulk_download_metadata)
-        btn_grid.addWidget(self.btn_bulk_metadata, 2, 0)
-
-        self.btn_bulk_thumbnails = QPushButton("🖼 6. Download Thumbnails (V1 Thumbnail...)")
+        self.btn_bulk_thumbnails = QPushButton("🖼 4. Download Thumbnails (Thumbnails/ folder)")
         self.btn_bulk_thumbnails.clicked.connect(self._bulk_download_thumbnails)
-        btn_grid.addWidget(self.btn_bulk_thumbnails, 2, 1)
+        btn_grid.addWidget(self.btn_bulk_thumbnails, 1, 1)
+
+        self.btn_bulk_mp3s = QPushButton("🎵 5. Download All Audio (Audio/ folder)")
+        self.btn_bulk_mp3s.clicked.connect(self._bulk_download_mp3s)
+        btn_grid.addWidget(self.btn_bulk_mp3s, 2, 0)
+
+        self.btn_bulk_videos = QPushButton("🎬 6. Download All Videos (Videos/ folder)")
+        self.btn_bulk_videos.clicked.connect(self._bulk_download_videos)
+        btn_grid.addWidget(self.btn_bulk_videos, 2, 1)
 
         self.btn_bulk_channel_assets = QPushButton("🎨 7. Channel Assets (Banner & Logo)")
         self.btn_bulk_channel_assets.clicked.connect(self._bulk_download_channel_assets)
         btn_grid.addWidget(self.btn_bulk_channel_assets, 3, 0)
 
-        self.btn_bulk_all_3 = QPushButton("📦 8. Download 3 (Titles + Scripts + MP3s)")
+        self.btn_bulk_all_3 = QPushButton("📦 8. Download Core (Titles.txt + Scripts + Audio)")
         self.btn_bulk_all_3.clicked.connect(self._bulk_download_all_3)
         btn_grid.addWidget(self.btn_bulk_all_3, 3, 1)
 
-        self.btn_bulk_all = QPushButton("🌟 DOWNLOAD COMPLETE COMPETITOR PACKAGE (All Organized)")
+        self.btn_bulk_all = QPushButton("🌟 DOWNLOAD COMPLETE PACKAGE (Organized Folders)")
         self.btn_bulk_all.setStyleSheet("background-color: #34c759; color: #ffffff; font-weight: 700; font-size: 13px; padding: 10px;")
         self.btn_bulk_all.clicked.connect(self._bulk_download_all_together)
         btn_grid.addWidget(self.btn_bulk_all, 4, 0, 1, 2)
@@ -829,49 +897,37 @@ class ChannelView(QWidget):
     def _preset_select_all_data(self):
         self.chk_titles.setChecked(True)
         self.chk_scripts.setChecked(True)
-        self.chk_mp3s.setChecked(True)
-        self.chk_videos.setChecked(True)
-        self.chk_metadata.setChecked(True)
-        self.chk_descriptions.setChecked(True)
-        self.chk_tags.setChecked(True)
         self.chk_thumbnails.setChecked(True)
+        self.chk_videos.setChecked(True)
+        self.chk_mp3s.setChecked(True)
         self.chk_channel_assets.setChecked(True)
 
     def _preset_deselect_all_data(self):
         self.chk_titles.setChecked(False)
         self.chk_scripts.setChecked(False)
-        self.chk_mp3s.setChecked(False)
-        self.chk_videos.setChecked(False)
-        self.chk_metadata.setChecked(False)
-        self.chk_descriptions.setChecked(False)
-        self.chk_tags.setChecked(False)
         self.chk_thumbnails.setChecked(False)
+        self.chk_videos.setChecked(False)
+        self.chk_mp3s.setChecked(False)
         self.chk_channel_assets.setChecked(False)
 
-    def _preset_text_metadata_data(self):
+    def _preset_scripts_titles_data(self):
         self._preset_deselect_all_data()
         self.chk_titles.setChecked(True)
         self.chk_scripts.setChecked(True)
-        self.chk_metadata.setChecked(True)
-        self.chk_descriptions.setChecked(True)
-        self.chk_tags.setChecked(True)
 
     def _preset_media_only_data(self):
         self._preset_deselect_all_data()
         self.chk_thumbnails.setChecked(True)
-        self.chk_mp3s.setChecked(True)
         self.chk_videos.setChecked(True)
+        self.chk_mp3s.setChecked(True)
         self.chk_channel_assets.setChecked(True)
 
-    def _preset_competitor_package_data(self):
+    def _preset_core_package_data(self):
         self._preset_deselect_all_data()
         self.chk_titles.setChecked(True)
         self.chk_scripts.setChecked(True)
-        self.chk_mp3s.setChecked(True)
-        self.chk_metadata.setChecked(True)
-        self.chk_descriptions.setChecked(True)
-        self.chk_tags.setChecked(True)
         self.chk_thumbnails.setChecked(True)
+        self.chk_mp3s.setChecked(True)
         self.chk_channel_assets.setChecked(True)
 
     # ==================== FETCH ACTIONS ====================
@@ -908,7 +964,7 @@ class ChannelView(QWidget):
         self.lbl_table_status.setText("Fetch stopped immediately.")
 
     def _stop_all_batch_threads(self):
-        for th in [self.transcripts_thread, self.metadata_thread, self.thumbnail_thread, self.channel_assets_thread]:
+        for th in [self.transcripts_thread, self.thumbnail_thread, self.channel_assets_thread]:
             if th and th.isRunning():
                 if hasattr(th, "cancel"):
                     th.cancel()
@@ -917,8 +973,10 @@ class ChannelView(QWidget):
                 except Exception:
                     pass
                 th.quit()
-        self.box_transcript_progress.setVisible(False)
-        self.lbl_table_status.setText("All background processes stopped.")
+        self.btn_resume_prog.setVisible(True)
+        self.lbl_transcript_status.setText("⏸ Download paused/stopped.")
+        self.lbl_progress_details.setText("Click 'Resume' to continue downloading remaining items.")
+        self.lbl_table_status.setText("Processes stopped. Click 'Resume Download' anytime to continue.")
 
     def _stop_transcripts_clicked(self):
         self._stop_all_batch_threads()
@@ -1136,7 +1194,9 @@ class ChannelView(QWidget):
             quality = self.combo_video_quality.currentText()
             fmt = self.combo_video_format.currentText()
         else:
-            custom_dir = out_dir
+            a_dir = Path(out_dir) / "Audio"
+            a_dir.mkdir(parents=True, exist_ok=True)
+            custom_dir = str(a_dir)
             quality = self.combo_quality.currentText()
             fmt = self.combo_format.currentText()
 
@@ -1159,7 +1219,7 @@ class ChannelView(QWidget):
     # ==================== UNIFIED CUSTOM DATA PIPELINE ====================
 
     def _download_selected_items_clicked(self):
-        """Unified download pipeline: processes only checked data types for selected range."""
+        """Unified download pipeline: processes only checked data types for selected range with live saving."""
         selected = self._sync_selected_candidates()
         if not selected:
             if self.candidates:
@@ -1182,23 +1242,17 @@ class ChannelView(QWidget):
         # Check which checkboxes are enabled in Custom Data Selection Panel
         want_titles = self.chk_titles.isChecked()
         want_scripts = self.chk_scripts.isChecked()
-        want_mp3s = self.chk_mp3s.isChecked()
-        want_videos = self.chk_videos.isChecked()
-        want_metadata = self.chk_metadata.isChecked()
-        want_descriptions = self.chk_descriptions.isChecked()
-        want_tags = self.chk_tags.isChecked()
         want_thumbnails = self.chk_thumbnails.isChecked()
+        want_videos = self.chk_videos.isChecked()
+        want_mp3s = self.chk_mp3s.isChecked()
         want_channel_assets = self.chk_channel_assets.isChecked()
 
         if not any([
             want_titles,
             want_scripts,
-            want_mp3s,
-            want_videos,
-            want_metadata,
-            want_descriptions,
-            want_tags,
             want_thumbnails,
+            want_videos,
+            want_mp3s,
             want_channel_assets,
         ]):
             QMessageBox.warning(
@@ -1217,19 +1271,19 @@ class ChannelView(QWidget):
         # Reset diagnostics
         self.diagnostics_dict.clear()
         self.btn_view_diagnostics.setVisible(False)
+        self.btn_resume_prog.setVisible(False)
 
-        # 1. Immediate sync export: Titles (Instant)
+        # 1. Immediate sync export: Single Titles.txt in root folder (Requirement 2)
         saved_titles_count = 0
         if want_titles:
-            titles_dir = base_dir / "Titles"
-            titles_dir.mkdir(parents=True, exist_ok=True)
-            saved = ZipPackager.export_titles_folder(
+            titles_file = base_dir / "Titles.txt"
+            ZipPackager.export_single_titles_file(
                 candidates=selected,
-                output_dir=base_dir,
+                output_file=titles_file,
                 channel_name=channel_name,
                 channel_url=channel_url,
             )
-            saved_titles_count = len(saved)
+            saved_titles_count = len(selected)
 
         # 2. Async Channel Assets (fires in background)
         if want_channel_assets and channel_url:
@@ -1243,17 +1297,17 @@ class ChannelView(QWidget):
             )
             self.channel_assets_thread.start()
 
-        # Build sequential phase queue for remaining heavy tasks
+        # Build sequential phase queue for remaining tasks (thumbnails -> scripts)
         phases = []
         if want_thumbnails:
             phases.append("thumbnails")
-        if want_metadata or want_tags or want_descriptions:
-            phases.append("metadata")
         if want_scripts:
             phases.append("scripts")
 
         self.box_transcript_progress.setVisible(True)
         self.bar_transcripts.setValue(0)
+        self.lbl_transcript_status.setText("Preparing download...")
+        self.lbl_progress_details.setText(f"Initializing tasks for {len(selected)} videos...")
 
         self._active_pipeline = {
             "phases": phases,
@@ -1263,9 +1317,6 @@ class ChannelView(QWidget):
             "channel_name": channel_name,
             "channel_url": channel_url,
             "want_titles": want_titles,
-            "want_descriptions": want_descriptions,
-            "want_tags": want_tags,
-            "want_metadata": want_metadata,
             "want_scripts": want_scripts,
             "want_thumbnails": want_thumbnails,
             "want_channel_assets": want_channel_assets,
@@ -1273,12 +1324,15 @@ class ChannelView(QWidget):
             "want_videos": want_videos,
             "saved_titles": saved_titles_count,
             "saved_thumbs": 0,
-            "saved_meta": 0,
             "saved_scripts": 0,
             "queued_media": 0,
         }
 
         self._run_current_pipeline_phase()
+
+    def _resume_download_clicked(self):
+        """Resumes download. Automatically checks disk and skips already completed files instantly."""
+        self._download_selected_items_clicked()
 
     def _run_current_pipeline_phase(self):
         pipe = getattr(self, "_active_pipeline", None)
@@ -1303,15 +1357,18 @@ class ChannelView(QWidget):
             thumb_dir = base_dir / "Thumbnails"
             thumb_dir.mkdir(parents=True, exist_ok=True)
             self.bar_transcripts.setValue(0)
-            self.lbl_transcript_status.setText(f"Phase {step_num}/{total_phases}: Downloading thumbnails (0 / {len(selected)})...")
+            self.lbl_transcript_status.setText(f"Phase {step_num}/{total_phases}: Thumbnails (0 / {len(selected)})...")
+            self.lbl_progress_details.setText(f"Checking disk & downloading: 0 / {len(selected)}...")
 
             self.thumbnail_thread = BatchThumbnailThread(candidates=selected, output_dir=thumb_dir)
 
-            def _on_thumb_prog(cur, tot, t):
+            def _on_thumb_item_prog(cur, tot, done_c, skip_c, v_lbl, title):
                 pct = int((cur / tot) * 100) if tot > 0 else 0
                 self.bar_transcripts.setValue(pct)
-                short_t = (t[:35] + "...") if len(t) > 35 else t
-                self.lbl_transcript_status.setText(f"Phase {step_num}/{total_phases}: Thumbnails {cur}/{tot} ({pct}%) - {short_t}")
+                short_t = (title[:30] + "...") if len(title) > 30 else title
+                self.lbl_transcript_status.setText(f"Phase {step_num}/{total_phases}: Thumbnails | [{v_lbl}] {short_t}")
+                rem = tot - cur
+                self.lbl_progress_details.setText(f"✓ Completed: {done_c}  |  ⏭ Skipped (On Disk): {skip_c}  |  ⏳ Remaining: {rem}  |  Total: {tot}")
 
             def _on_thumb_done(is_ok, saved_list):
                 if not is_ok:
@@ -1321,84 +1378,16 @@ class ChannelView(QWidget):
                 pipe["current_index"] += 1
                 self._run_current_pipeline_phase()
 
-            self.thumbnail_thread.progress_signal.connect(_on_thumb_prog)
+            self.thumbnail_thread.item_progress.connect(_on_thumb_item_prog)
             self.thumbnail_thread.all_finished.connect(_on_thumb_done)
             self.thumbnail_thread.start()
-
-        elif current_phase == "metadata":
-            meta_dir = base_dir / "Metadata"
-            tags_dir = base_dir / "Tags"
-            desc_dir = base_dir / "Descriptions"
-            if pipe["want_metadata"]:
-                meta_dir.mkdir(parents=True, exist_ok=True)
-            if pipe["want_tags"]:
-                tags_dir.mkdir(parents=True, exist_ok=True)
-            if pipe["want_descriptions"]:
-                desc_dir.mkdir(parents=True, exist_ok=True)
-
-            self.bar_transcripts.setValue(0)
-            self.lbl_transcript_status.setText(f"Phase {step_num}/{total_phases}: Fetching metadata & tags (0 / {len(selected)})...")
-
-            self.metadata_thread = BatchMetadataThread(
-                candidates=selected,
-                existing_metadata=self.metadata_dict,
-                output_dir=meta_dir,
-            )
-
-            def _on_meta_prog(cur, tot, t):
-                pct = int((cur / tot) * 100) if tot > 0 else 0
-                self.bar_transcripts.setValue(pct)
-                short_t = (t[:35] + "...") if len(t) > 35 else t
-                self.lbl_transcript_status.setText(f"Phase {step_num}/{total_phases}: Metadata {cur}/{tot} ({pct}%) - {short_t}")
-
-            def _on_meta_item(vid_id, info):
-                self.metadata_dict[vid_id] = info
-
-            def _on_meta_done(is_ok):
-                if not is_ok:
-                    self.box_transcript_progress.setVisible(False)
-                    return
-
-                if pipe["want_metadata"]:
-                    saved_m = MetadataPurifier.export_metadata_to_folder(
-                        candidates=selected,
-                        metadata_dict=self.metadata_dict,
-                        output_dir=meta_dir,
-                        channel_name=pipe["channel_name"],
-                        channel_url=pipe["channel_url"],
-                    )
-                    pipe["saved_meta"] = len(saved_m)
-
-                if pipe["want_tags"]:
-                    MetadataPurifier.export_tags_to_folder(
-                        candidates=selected,
-                        metadata_dict=self.metadata_dict,
-                        output_dir=tags_dir,
-                        channel_name=pipe["channel_name"],
-                    )
-
-                if pipe["want_descriptions"]:
-                    MetadataPurifier.export_descriptions_to_folder(
-                        candidates=selected,
-                        metadata_dict=self.metadata_dict,
-                        output_dir=desc_dir,
-                        channel_name=pipe["channel_name"],
-                        channel_url=pipe["channel_url"],
-                    )
-
-                pipe["current_index"] += 1
-                self._run_current_pipeline_phase()
-
-            self.metadata_thread.progress_signal.connect(_on_meta_prog)
-            self.metadata_thread.item_fetched.connect(_on_meta_item)
-            self.metadata_thread.all_finished.connect(_on_meta_done)
-            self.metadata_thread.start()
 
         elif current_phase == "scripts":
             scripts_dir = base_dir / "Scripts"
             scripts_dir.mkdir(parents=True, exist_ok=True)
             self.bar_transcripts.setValue(0)
             self.lbl_transcript_status.setText(f"Phase {step_num}/{total_phases}: Discovering transcripts (0 / {len(selected)})...")
+            self.lbl_progress_details.setText(f"Checking disk & searching captions: 0 / {len(selected)}...")
 
             self.transcripts_thread = BatchTranscriptThread(
                 candidates=selected,
@@ -1406,11 +1395,13 @@ class ChannelView(QWidget):
                 output_dir=scripts_dir,
             )
 
-            def _on_script_prog(cur, tot, t):
+            def _on_script_item_prog(cur, tot, done_c, skip_c, v_lbl, title):
                 pct = int((cur / tot) * 100) if tot > 0 else 0
                 self.bar_transcripts.setValue(pct)
-                short_t = (t[:35] + "...") if len(t) > 35 else t
-                self.lbl_transcript_status.setText(f"Phase {step_num}/{total_phases}: Scripts {cur}/{tot} ({pct}%) - {short_t}")
+                short_t = (title[:30] + "...") if len(title) > 30 else title
+                self.lbl_transcript_status.setText(f"Phase {step_num}/{total_phases}: Scripts | [{v_lbl}] {short_t}")
+                rem = tot - cur
+                self.lbl_progress_details.setText(f"✓ Completed: {done_c}  |  ⏭ Skipped (On Disk): {skip_c}  |  ⏳ Remaining: {rem}  |  Total: {tot}")
 
             def _on_script_item(vid_id, text):
                 self.transcripts_dict[vid_id] = text
@@ -1434,7 +1425,7 @@ class ChannelView(QWidget):
                 pipe["current_index"] += 1
                 self._run_current_pipeline_phase()
 
-            self.transcripts_thread.progress_signal.connect(_on_script_prog)
+            self.transcripts_thread.item_progress.connect(_on_script_item_prog)
             self.transcripts_thread.item_fetched.connect(_on_script_item)
             self.transcripts_thread.item_diagnostics.connect(_on_script_diag)
             self.transcripts_thread.all_finished.connect(_on_script_done)
@@ -1450,15 +1441,17 @@ class ChannelView(QWidget):
         base_dir = pipe["base_dir"]
 
         media_items = []
-        # Queue MP3s if selected
+        # Queue Audio MP3s if selected into Audio/ subfolder
         if pipe["want_mp3s"]:
+            audio_dir = base_dir / "Audio"
+            audio_dir.mkdir(parents=True, exist_ok=True)
             for cand in selected:
                 item = DownloadItem(
                     url=cand.url,
                     media_type="Audio",
                     quality=self.combo_quality.currentText(),
                     format_ext=self.combo_format.currentText(),
-                    custom_output_dir=str(base_dir),
+                    custom_output_dir=str(audio_dir),
                     version_label=cand.version_label,
                     title=cand.title,
                     channel=cand.uploader,
@@ -1467,7 +1460,7 @@ class ChannelView(QWidget):
                 )
                 media_items.append(item)
 
-        # Queue Videos if selected
+        # Queue Videos if selected into Videos/ subfolder
         if pipe["want_videos"]:
             v_dir = base_dir / "Videos"
             v_dir.mkdir(parents=True, exist_ok=True)
@@ -1495,25 +1488,19 @@ class ChannelView(QWidget):
         order = self.combo_order.currentText()
         summary_lines = [f"Successfully processed {len(selected)} videos in {order} order!\n"]
         if pipe["want_titles"]:
-            summary_lines.append(f"• Titles: {base_dir / 'Titles'} ({pipe['saved_titles']} files)")
-        if pipe["want_descriptions"]:
-            summary_lines.append(f"• Descriptions: {base_dir / 'Descriptions'}")
-        if pipe["want_tags"]:
-            summary_lines.append(f"• Tags: {base_dir / 'Tags'} (+ master all_tags.txt)")
-        if pipe["want_metadata"]:
-            summary_lines.append(f"• Purified Metadata: {base_dir / 'Metadata'} ({pipe['saved_meta']} files)")
-        if pipe["want_thumbnails"]:
-            summary_lines.append(f"• Thumbnails: {base_dir / 'Thumbnails'} ({pipe['saved_thumbs']} files)")
+            summary_lines.append(f"• Titles: {base_dir / 'Titles.txt'} (1 master TXT file)")
         if pipe["want_scripts"]:
-            summary_lines.append(f"• Scripts: {base_dir / 'Scripts'} ({pipe['saved_scripts']} transcripts found)")
-        if pipe["want_channel_assets"]:
-            summary_lines.append(f"• Channel Assets: {base_dir / 'Channel Assets'}")
+            summary_lines.append(f"• Scripts: {base_dir / 'Scripts'} ({pipe['saved_scripts']} transcripts saved live)")
+        if pipe["want_thumbnails"]:
+            summary_lines.append(f"• Thumbnails: {base_dir / 'Thumbnails'} ({pipe['saved_thumbs']} thumbnails saved)")
         if pipe["want_mp3s"]:
-            summary_lines.append(f"• Audio MP3: Queued {len(selected)} tasks to Download Queue")
+            summary_lines.append(f"• Audio MP3: Queued {len(selected)} tasks to {base_dir / 'Audio'}")
         if pipe["want_videos"]:
             summary_lines.append(
                 f"• Video Files: Queued {len(selected)} tasks ({self.combo_video_quality.currentText()}) to {base_dir / 'Videos'}"
             )
+        if pipe["want_channel_assets"]:
+            summary_lines.append(f"• Channel Assets: {base_dir / 'Channel Assets'}")
 
         # Check if any transcripts were missing
         failed_scripts = [
@@ -1604,27 +1591,26 @@ class ChannelView(QWidget):
             return
 
         out_dir = Path(self.txt_out_dir.text().strip())
+        out_dir.mkdir(parents=True, exist_ok=True)
         channel_name = self.fetcher.channel_name or (selected[0].uploader if selected else "")
         channel_url = self.fetcher.channel_url or (selected[0].channel_url if selected else "")
 
-        saved = ZipPackager.export_titles_folder(
+        titles_file = out_dir / "Titles.txt"
+        ZipPackager.export_single_titles_file(
             candidates=selected,
-            output_dir=out_dir,
+            output_file=titles_file,
             channel_name=channel_name,
             channel_url=channel_url,
         )
-        titles_dir = out_dir / "Titles"
         QMessageBox.information(
             self,
             "Titles Saved",
-            f"Successfully saved {len(saved)} title TXT files to:\n\n{titles_dir}\n\n"
-            "Format in each file:\n"
-            "Line 1: Competitor Channel Name\n"
-            "Line 2: Competitor Channel Link\n"
-            "Line 3: V{i}. Video Title",
+            f"Successfully saved all titles into single file:\n\n{titles_file}\n\n"
+            f"Total videos listed: {len(selected)}\n"
+            "Format: V1 — Title of video 1, V2 — Title of video 2...",
         )
         if sys.platform == "darwin":
-            subprocess.run(["open", str(titles_dir)])
+            subprocess.run(["open", "-R", str(titles_file)])
 
     def _bulk_download_scripts(self):
         selected = self._sync_selected_candidates()
@@ -1636,8 +1622,10 @@ class ChannelView(QWidget):
         out_dir.mkdir(parents=True, exist_ok=True)
 
         self.box_transcript_progress.setVisible(True)
+        self.btn_resume_prog.setVisible(False)
         self.bar_transcripts.setValue(0)
         self.lbl_transcript_status.setText(f"Fetching scripts: 0 / {len(selected)} (0%)...")
+        self.lbl_progress_details.setText("Checking disk & retrieving transcripts live...")
 
         self.transcripts_thread = BatchTranscriptThread(
             candidates=selected,
@@ -1645,11 +1633,13 @@ class ChannelView(QWidget):
             output_dir=out_dir,
         )
 
-        def _on_progress(cur, tot, title):
-            pct = int((cur / tot) * 100)
+        def _on_item_prog(cur, tot, done_c, skip_c, v_lbl, title):
+            pct = int((cur / tot) * 100) if tot > 0 else 0
             self.bar_transcripts.setValue(pct)
-            short_title = (title[:40] + "...") if len(title) > 40 else title
-            self.lbl_transcript_status.setText(f"Downloading scripts: {cur} / {tot} ({pct}%) - {short_title}")
+            short_title = (title[:32] + "...") if len(title) > 32 else title
+            self.lbl_transcript_status.setText(f"Scripts: {cur} / {tot} ({pct}%) - [{v_lbl}] {short_title}")
+            rem = tot - cur
+            self.lbl_progress_details.setText(f"✓ Completed: {done_c}  |  ⏭ Skipped: {skip_c}  |  ⏳ Remaining: {rem}  |  Total: {tot}")
 
         def _on_item(vid_id, text):
             self.transcripts_dict[vid_id] = text
@@ -1666,22 +1656,68 @@ class ChannelView(QWidget):
             )
             self._populate_table()
             if is_completed:
-                self.lbl_table_status.setText(f"Exported {len(saved)} script files (V1 Script.txt..).")
+                self.lbl_table_status.setText(f"Saved {len(saved)} script files live into Scripts/.")
                 QMessageBox.information(
                     self,
-                    "Scripts Exported",
-                    f"Successfully exported {len(saved)} clean script files (V1 Script.txt, V2 Script.txt...) to:\n\n{out_dir}",
+                    "Scripts Saved",
+                    f"Successfully saved {len(saved)} clean script files (V1 Script.txt, V2 Script.txt...) to:\n\n{out_dir}",
                 )
                 if sys.platform == "darwin":
                     subprocess.run(["open", str(out_dir)])
             else:
                 self.lbl_table_status.setText(f"Script download stopped. Saved {len(saved)} files.")
 
-        self.transcripts_thread.progress_signal.connect(_on_progress)
+        self.transcripts_thread.item_progress.connect(_on_item_prog)
         self.transcripts_thread.item_fetched.connect(_on_item)
         self.transcripts_thread.item_diagnostics.connect(_on_diag)
         self.transcripts_thread.all_finished.connect(_on_done)
         self.transcripts_thread.start()
+
+    def _bulk_download_thumbnails(self):
+        selected = self._sync_selected_candidates()
+        if not selected:
+            QMessageBox.warning(self, "No Selection", "Please select at least one video.")
+            return
+
+        out_dir = Path(self.txt_out_dir.text().strip()) / "Thumbnails"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.box_transcript_progress.setVisible(True)
+        self.btn_resume_prog.setVisible(False)
+        self.bar_transcripts.setValue(0)
+        self.lbl_transcript_status.setText(f"Downloading thumbnails: 0 / {len(selected)} (0%)...")
+        self.lbl_progress_details.setText("Checking disk & downloading thumbnails live...")
+
+        self.thumbnail_thread = BatchThumbnailThread(
+            candidates=selected,
+            output_dir=out_dir,
+        )
+
+        def _on_thumb_item_prog(cur, tot, done_c, skip_c, v_lbl, title):
+            pct = int((cur / tot) * 100) if tot > 0 else 0
+            self.bar_transcripts.setValue(pct)
+            short_t = (title[:32] + "...") if len(title) > 32 else title
+            self.lbl_transcript_status.setText(f"Thumbnails: {cur} / {tot} ({pct}%) - [{v_lbl}] {short_t}")
+            rem = tot - cur
+            self.lbl_progress_details.setText(f"✓ Completed: {done_c}  |  ⏭ Skipped: {skip_c}  |  ⏳ Remaining: {rem}  |  Total: {tot}")
+
+        def _on_done(is_completed, saved):
+            self.box_transcript_progress.setVisible(False)
+            if is_completed:
+                self.lbl_table_status.setText(f"Downloaded {len(saved)} thumbnails into Thumbnails/.")
+                QMessageBox.information(
+                    self,
+                    "Thumbnails Downloaded",
+                    f"Successfully downloaded {len(saved)} thumbnails (V1 Thumbnail.jpg, V2 Thumbnail.jpg...) to:\n\n{out_dir}",
+                )
+                if sys.platform == "darwin":
+                    subprocess.run(["open", str(out_dir)])
+            else:
+                self.lbl_table_status.setText(f"Thumbnail download stopped. Saved {len(saved)} files.")
+
+        self.thumbnail_thread.item_progress.connect(_on_thumb_item_prog)
+        self.thumbnail_thread.all_finished.connect(_on_done)
+        self.thumbnail_thread.start()
 
     def _bulk_download_mp3s(self):
         selected = self._sync_selected_candidates()
@@ -1689,7 +1725,8 @@ class ChannelView(QWidget):
             QMessageBox.warning(self, "No Selection", "Please select at least one video.")
             return
 
-        out_dir = self.txt_out_dir.text().strip()
+        out_dir = Path(self.txt_out_dir.text().strip()) / "Audio"
+        out_dir.mkdir(parents=True, exist_ok=True)
         items = []
         for cand in selected:
             item = DownloadItem(
@@ -1697,7 +1734,7 @@ class ChannelView(QWidget):
                 media_type="Audio",
                 quality=self.combo_quality.currentText(),
                 format_ext=self.combo_format.currentText(),
-                custom_output_dir=out_dir,
+                custom_output_dir=str(out_dir),
                 version_label=cand.version_label,
                 title=cand.title,
                 channel=cand.uploader,
@@ -1711,110 +1748,46 @@ class ChannelView(QWidget):
         QMessageBox.information(
             self,
             "Queued for Download",
-            f"Added {len(items)} MP3 tasks (V1.mp3, V2.mp3...) to the queue!\n"
-            "Will download 3 files simultaneously in parallel until all complete.",
+            f"Added {len(items)} MP3 audio tasks (V1.mp3, V2.mp3...) to the queue!\n"
+            f"Folder: {out_dir}\n"
+            "Will download simultaneously in parallel until all complete.",
         )
         self.switch_to_downloads_requested.emit()
 
-    def _bulk_download_metadata(self):
+    def _bulk_download_videos(self):
         selected = self._sync_selected_candidates()
         if not selected:
             QMessageBox.warning(self, "No Selection", "Please select at least one video.")
             return
 
-        out_dir = Path(self.txt_out_dir.text().strip()) / "Metadata"
+        out_dir = Path(self.txt_out_dir.text().strip()) / "Videos"
         out_dir.mkdir(parents=True, exist_ok=True)
-
-        channel_name = self.fetcher.channel_name or (selected[0].uploader if selected else "")
-        channel_url = self.fetcher.channel_url or (selected[0].channel_url if selected else "")
-
-        self.box_transcript_progress.setVisible(True)
-        self.bar_transcripts.setValue(0)
-        self.lbl_transcript_status.setText(f"Purifying metadata: 0 / {len(selected)} (0%)...")
-
-        self.metadata_thread = BatchMetadataThread(
-            candidates=selected,
-            existing_metadata=self.metadata_dict,
-            output_dir=out_dir,
-        )
-
-        def _on_progress(cur, tot, title):
-            pct = int((cur / tot) * 100)
-            self.bar_transcripts.setValue(pct)
-            short_t = (title[:40] + "...") if len(title) > 40 else title
-            self.lbl_transcript_status.setText(f"Purifying metadata: {cur} / {tot} ({pct}%) - {short_t}")
-
-        def _on_item(vid_id, info):
-            self.metadata_dict[vid_id] = info
-
-        def _on_done(is_completed):
-            self.box_transcript_progress.setVisible(False)
-            saved = MetadataPurifier.export_metadata_to_folder(
-                candidates=selected,
-                metadata_dict=self.metadata_dict,
-                output_dir=out_dir,
-                channel_name=channel_name,
-                channel_url=channel_url,
+        items = []
+        for cand in selected:
+            item = DownloadItem(
+                url=cand.url,
+                media_type="Video",
+                quality=self.combo_video_quality.currentText(),
+                format_ext=self.combo_video_format.currentText(),
+                custom_output_dir=str(out_dir),
+                version_label=cand.version_label,
+                title=cand.title,
+                channel=cand.uploader,
+                duration_sec=cand.duration,
+                video_id=cand.video_id,
             )
-            if is_completed:
-                self.lbl_table_status.setText(f"Exported {len(saved)} purified metadata files.")
-                QMessageBox.information(
-                    self,
-                    "Metadata Exported",
-                    f"Successfully exported {len(saved)} purified metadata files (V1 Metadata.txt, V2 Metadata.txt...) to:\n\n{out_dir}\n\n"
-                    "All URLs, external links, promotional links, social links, and competitor branding have been removed.",
-                )
-                if sys.platform == "darwin":
-                    subprocess.run(["open", str(out_dir)])
-            else:
-                self.lbl_table_status.setText(f"Metadata download stopped. Saved {len(saved)} files.")
+            items.append(item)
 
-        self.metadata_thread.progress_signal.connect(_on_progress)
-        self.metadata_thread.item_fetched.connect(_on_item)
-        self.metadata_thread.all_finished.connect(_on_done)
-        self.metadata_thread.start()
-
-    def _bulk_download_thumbnails(self):
-        selected = self._sync_selected_candidates()
-        if not selected:
-            QMessageBox.warning(self, "No Selection", "Please select at least one video.")
-            return
-
-        out_dir = Path(self.txt_out_dir.text().strip()) / "Thumbnails"
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        self.box_transcript_progress.setVisible(True)
-        self.bar_transcripts.setValue(0)
-        self.lbl_transcript_status.setText(f"Downloading thumbnails: 0 / {len(selected)} (0%)...")
-
-        self.thumbnail_thread = BatchThumbnailThread(
-            candidates=selected,
-            output_dir=out_dir,
+        self.queue_manager.add_items(items)
+        self.queue_manager.start()
+        QMessageBox.information(
+            self,
+            "Queued for Download",
+            f"Added {len(items)} Video tasks ({self.combo_video_quality.currentText()}) to the queue!\n"
+            f"Folder: {out_dir}\n"
+            "Will download simultaneously in parallel until all complete.",
         )
-
-        def _on_progress(cur, tot, title):
-            pct = int((cur / tot) * 100)
-            self.bar_transcripts.setValue(pct)
-            short_t = (title[:40] + "...") if len(title) > 40 else title
-            self.lbl_transcript_status.setText(f"Downloading thumbnails: {cur} / {tot} ({pct}%) - {short_t}")
-
-        def _on_done(is_completed, saved):
-            self.box_transcript_progress.setVisible(False)
-            if is_completed:
-                self.lbl_table_status.setText(f"Downloaded {len(saved)} thumbnails.")
-                QMessageBox.information(
-                    self,
-                    "Thumbnails Downloaded",
-                    f"Successfully downloaded {len(saved)} thumbnails (V1 Thumbnail.jpg, V2 Thumbnail.jpg...) to:\n\n{out_dir}",
-                )
-                if sys.platform == "darwin":
-                    subprocess.run(["open", str(out_dir)])
-            else:
-                self.lbl_table_status.setText(f"Thumbnail download stopped. Saved {len(saved)} files.")
-
-        self.thumbnail_thread.progress_signal.connect(_on_progress)
-        self.thumbnail_thread.all_finished.connect(_on_done)
-        self.thumbnail_thread.start()
+        self.switch_to_downloads_requested.emit()
 
     def _bulk_download_channel_assets(self):
         channel_url = self.fetcher.channel_url or (self.candidates[0].channel_url if self.candidates else self.txt_url.text().strip())
@@ -1872,14 +1845,25 @@ class ChannelView(QWidget):
         out_dir.mkdir(parents=True, exist_ok=True)
         scripts_dir = out_dir / "Scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
+        audio_dir = out_dir / "Audio"
+        audio_dir.mkdir(parents=True, exist_ok=True)
 
         channel_name = self.fetcher.channel_name or (selected[0].uploader if selected else "")
         channel_url = self.fetcher.channel_url or (selected[0].channel_url if selected else "")
 
-        ZipPackager.export_titles_folder(selected, out_dir, channel_name=channel_name, channel_url=channel_url)
+        # 1. Single Titles.txt in root folder
+        ZipPackager.export_single_titles_file(
+            candidates=selected,
+            output_file=out_dir / "Titles.txt",
+            channel_name=channel_name,
+            channel_url=channel_url,
+        )
 
         self.box_transcript_progress.setVisible(True)
+        self.btn_resume_prog.setVisible(False)
+        self.bar_transcripts.setValue(0)
         self.lbl_transcript_status.setText(f"Fetching scripts: 0 / {len(selected)}...")
+        self.lbl_progress_details.setText("Checking disk & retrieving scripts live...")
 
         self.transcripts_thread = BatchTranscriptThread(
             candidates=selected,
@@ -1887,11 +1871,13 @@ class ChannelView(QWidget):
             output_dir=scripts_dir,
         )
 
-        def _on_progress(cur, tot, title):
-            pct = int((cur / tot) * 100)
+        def _on_item_prog(cur, tot, done_c, skip_c, v_lbl, title):
+            pct = int((cur / tot) * 100) if tot > 0 else 0
             self.bar_transcripts.setValue(pct)
-            short_title = (title[:40] + "...") if len(title) > 40 else title
-            self.lbl_transcript_status.setText(f"Downloading scripts: {cur} / {tot} ({pct}%) - {short_title}")
+            short_title = (title[:30] + "...") if len(title) > 30 else title
+            self.lbl_transcript_status.setText(f"Scripts: {cur} / {tot} ({pct}%) - [{v_lbl}] {short_title}")
+            rem = tot - cur
+            self.lbl_progress_details.setText(f"✓ Completed: {done_c}  |  ⏭ Skipped: {skip_c}  |  ⏳ Remaining: {rem}  |  Total: {tot}")
 
         def _on_item(vid_id, text):
             self.transcripts_dict[vid_id] = text
@@ -1912,7 +1898,7 @@ class ChannelView(QWidget):
                     media_type="Audio",
                     quality=self.combo_quality.currentText(),
                     format_ext=self.combo_format.currentText(),
-                    custom_output_dir=str(out_dir),
+                    custom_output_dir=str(audio_dir),
                     version_label=cand.version_label,
                     title=cand.title,
                     channel=cand.uploader,
@@ -1928,13 +1914,13 @@ class ChannelView(QWidget):
                 self,
                 "Batch Package Started",
                 f"Queued all {len(items)} versions for matched Title + Script + MP3 generation!\n\n"
-                f"• Titles saved to: {out_dir / 'Titles'}\n"
-                f"• Scripts saved to: {scripts_dir}\n"
-                f"• MP3s (V1.mp3, V2.mp3...) downloading to: {out_dir}",
+                f"• Titles: {out_dir / 'Titles.txt'} (1 single TXT)\n"
+                f"• Scripts: {scripts_dir}\n"
+                f"• Audio: {audio_dir} (V1.mp3, V2.mp3...)",
             )
             self.switch_to_downloads_requested.emit()
 
-        self.transcripts_thread.progress_signal.connect(_on_progress)
+        self.transcripts_thread.item_progress.connect(_on_item_prog)
         self.transcripts_thread.item_fetched.connect(_on_item)
         self.transcripts_thread.all_finished.connect(_on_done)
         self.transcripts_thread.start()
@@ -1947,23 +1933,28 @@ class ChannelView(QWidget):
 
         base_dir = Path(self.txt_out_dir.text().strip())
         base_dir.mkdir(parents=True, exist_ok=True)
-        titles_dir = base_dir / "Titles"
         scripts_dir = base_dir / "Scripts"
-        meta_dir = base_dir / "Metadata"
         thumb_dir = base_dir / "Thumbnails"
         assets_dir = base_dir / "Channel Assets"
+        audio_dir = base_dir / "Audio"
 
-        titles_dir.mkdir(parents=True, exist_ok=True)
         scripts_dir.mkdir(parents=True, exist_ok=True)
-        meta_dir.mkdir(parents=True, exist_ok=True)
         thumb_dir.mkdir(parents=True, exist_ok=True)
         assets_dir.mkdir(parents=True, exist_ok=True)
+        audio_dir.mkdir(parents=True, exist_ok=True)
 
         channel_name = self.fetcher.channel_name or (selected[0].uploader if selected else "")
         channel_url = self.fetcher.channel_url or (selected[0].channel_url if selected else self.txt_url.text().strip())
 
-        ZipPackager.export_titles_folder(selected, titles_dir, channel_name=channel_name, channel_url=channel_url)
+        # 1. Single Titles.txt in root folder
+        ZipPackager.export_single_titles_file(
+            candidates=selected,
+            output_file=base_dir / "Titles.txt",
+            channel_name=channel_name,
+            channel_url=channel_url,
+        )
 
+        # 2. Channel assets
         if channel_url:
             self.channel_assets_thread = ChannelAssetsThread(
                 channel_url=channel_url,
@@ -1974,19 +1965,23 @@ class ChannelView(QWidget):
             self.channel_assets_thread.start()
 
         self.box_transcript_progress.setVisible(True)
+        self.btn_resume_prog.setVisible(False)
         self.bar_transcripts.setValue(0)
-        self.lbl_transcript_status.setText(f"Phase 1/3: Downloading thumbnails (0 / {len(selected)})...")
+        self.lbl_transcript_status.setText(f"Phase 1/2: Downloading thumbnails (0 / {len(selected)})...")
+        self.lbl_progress_details.setText("Checking disk & downloading thumbnails live...")
 
         self.thumbnail_thread = BatchThumbnailThread(
             candidates=selected,
             output_dir=thumb_dir,
         )
 
-        def _on_thumb_prog(cur, tot, t):
-            pct = int((cur / tot) * 100)
+        def _on_thumb_item_prog(cur, tot, done_c, skip_c, v_lbl, title):
+            pct = int((cur / tot) * 100) if tot > 0 else 0
             self.bar_transcripts.setValue(pct)
-            short_t = (t[:35] + "...") if len(t) > 35 else t
-            self.lbl_transcript_status.setText(f"Phase 1/3: Thumbnails {cur}/{tot} ({pct}%) - {short_t}")
+            short_t = (title[:30] + "...") if len(title) > 30 else title
+            self.lbl_transcript_status.setText(f"Phase 1/2: Thumbnails | [{v_lbl}] {short_t}")
+            rem = tot - cur
+            self.lbl_progress_details.setText(f"✓ Completed: {done_c}  |  ⏭ Skipped: {skip_c}  |  ⏳ Remaining: {rem}  |  Total: {tot}")
 
         def _on_thumb_done(is_ok, _):
             if not is_ok:
@@ -1994,109 +1989,75 @@ class ChannelView(QWidget):
                 return
 
             self.bar_transcripts.setValue(0)
-            self.lbl_transcript_status.setText(f"Phase 2/3: Purifying metadata (0 / {len(selected)})...")
+            self.lbl_transcript_status.setText(f"Phase 2/2: Downloading scripts (0 / {len(selected)})...")
+            self.lbl_progress_details.setText("Checking disk & retrieving scripts live...")
 
-            self.metadata_thread = BatchMetadataThread(
+            self.transcripts_thread = BatchTranscriptThread(
                 candidates=selected,
-                existing_metadata=self.metadata_dict,
-                output_dir=meta_dir,
+                existing_transcripts=self.transcripts_dict,
+                output_dir=scripts_dir,
             )
 
-            def _on_meta_prog(cur, tot, t):
-                pct = int((cur / tot) * 100)
+            def _on_script_item_prog(cur, tot, done_c, skip_c, v_lbl, title):
+                pct = int((cur / tot) * 100) if tot > 0 else 0
                 self.bar_transcripts.setValue(pct)
-                short_t = (t[:35] + "...") if len(t) > 35 else t
-                self.lbl_transcript_status.setText(f"Phase 2/3: Metadata {cur}/{tot} ({pct}%) - {short_t}")
+                short_t = (title[:30] + "...") if len(title) > 30 else title
+                self.lbl_transcript_status.setText(f"Phase 2/2: Scripts | [{v_lbl}] {short_t}")
+                rem = tot - cur
+                self.lbl_progress_details.setText(f"✓ Completed: {done_c}  |  ⏭ Skipped: {skip_c}  |  ⏳ Remaining: {rem}  |  Total: {tot}")
 
-            def _on_meta_item(vid_id, info):
-                self.metadata_dict[vid_id] = info
+            def _on_script_item(vid_id, text):
+                self.transcripts_dict[vid_id] = text
 
-            def _on_meta_done(is_meta_ok):
-                if not is_meta_ok:
-                    self.box_transcript_progress.setVisible(False)
-                    return
-
-                MetadataPurifier.export_metadata_to_folder(
+            def _on_script_done(is_script_ok):
+                self.box_transcript_progress.setVisible(False)
+                TranscriptFetcher.export_transcripts_to_folder(
                     candidates=selected,
-                    metadata_dict=self.metadata_dict,
-                    output_dir=meta_dir,
-                    channel_name=channel_name,
-                    channel_url=channel_url,
-                )
-
-                self.bar_transcripts.setValue(0)
-                self.lbl_transcript_status.setText(f"Phase 3/3: Downloading scripts (0 / {len(selected)})...")
-
-                self.transcripts_thread = BatchTranscriptThread(
-                    candidates=selected,
-                    existing_transcripts=self.transcripts_dict,
+                    transcripts_dict=self.transcripts_dict,
                     output_dir=scripts_dir,
                 )
+                self._populate_table()
 
-                def _on_script_prog(cur, tot, t):
-                    pct = int((cur / tot) * 100)
-                    self.bar_transcripts.setValue(pct)
-                    short_t = (t[:35] + "...") if len(t) > 35 else t
-                    self.lbl_transcript_status.setText(f"Phase 3/3: Scripts {cur}/{tot} ({pct}%) - {short_t}")
-
-                def _on_script_item(vid_id, text):
-                    self.transcripts_dict[vid_id] = text
-
-                def _on_script_done(is_script_ok):
-                    self.box_transcript_progress.setVisible(False)
-                    TranscriptFetcher.export_transcripts_to_folder(
-                        candidates=selected,
-                        transcripts_dict=self.transcripts_dict,
-                        output_dir=scripts_dir,
+                items = []
+                for cand in selected:
+                    item = DownloadItem(
+                        url=cand.url,
+                        media_type="Audio",
+                        quality=self.combo_quality.currentText(),
+                        format_ext=self.combo_format.currentText(),
+                        custom_output_dir=str(audio_dir),
+                        version_label=cand.version_label,
+                        title=cand.title,
+                        channel=cand.uploader,
+                        duration_sec=cand.duration,
+                        video_id=cand.video_id,
                     )
-                    self._populate_table()
+                    items.append(item)
 
-                    items = []
-                    for cand in selected:
-                        item = DownloadItem(
-                            url=cand.url,
-                            media_type="Audio",
-                            quality=self.combo_quality.currentText(),
-                            format_ext=self.combo_format.currentText(),
-                            custom_output_dir=str(base_dir),
-                            version_label=cand.version_label,
-                            title=cand.title,
-                            channel=cand.uploader,
-                            duration_sec=cand.duration,
-                            video_id=cand.video_id,
-                        )
-                        items.append(item)
+                self.queue_manager.add_items(items)
+                self.queue_manager.start()
 
-                    self.queue_manager.add_items(items)
-                    self.queue_manager.start()
+                QMessageBox.information(
+                    self,
+                    "Complete Package Downloaded",
+                    f"All {len(selected)} videos processed from V1 onward!\n\n"
+                    f"Organized output folders at: {base_dir}\n"
+                    f"• Titles: {base_dir / 'Titles.txt'} (1 single TXT file)\n"
+                    f"• Scripts: {scripts_dir}\n"
+                    f"• Thumbnails: {thumb_dir}\n"
+                    f"• Channel Assets: {assets_dir}\n"
+                    f"• Audio MP3: queued to {audio_dir}",
+                )
+                self.switch_to_downloads_requested.emit()
+                if sys.platform == "darwin":
+                    subprocess.run(["open", str(base_dir)])
 
-                    QMessageBox.information(
-                        self,
-                        "Competitor Assets Package Complete",
-                        f"All {len(selected)} videos processed from V1 onward!\n\n"
-                        f"Organized output folders at: {base_dir}\n"
-                        f"• Titles: {titles_dir}\n"
-                        f"• Scripts: {scripts_dir}\n"
-                        f"• Metadata: {meta_dir}\n"
-                        f"• Thumbnails: {thumb_dir}\n"
-                        f"• Channel Assets: {assets_dir}\n"
-                        f"• MP3 Voiceovers: downloading to {base_dir}",
-                    )
-                    self.switch_to_downloads_requested.emit()
-                    if sys.platform == "darwin":
-                        subprocess.run(["open", str(base_dir)])
+            self.transcripts_thread.item_progress.connect(_on_script_item_prog)
+            self.transcripts_thread.item_fetched.connect(_on_script_item)
+            self.transcripts_thread.all_finished.connect(_on_script_done)
+            self.transcripts_thread.start()
 
-                self.transcripts_thread.progress_signal.connect(_on_script_prog)
-                self.transcripts_thread.item_fetched.connect(_on_script_item)
-                self.transcripts_thread.all_finished.connect(_on_script_done)
-                self.transcripts_thread.start()
-
-            self.metadata_thread.progress_signal.connect(_on_meta_prog)
-            self.metadata_thread.item_fetched.connect(_on_meta_item)
-            self.metadata_thread.all_finished.connect(_on_meta_done)
-            self.metadata_thread.start()
-
-        self.thumbnail_thread.progress_signal.connect(_on_thumb_prog)
+        self.thumbnail_thread.item_progress.connect(_on_thumb_item_prog)
         self.thumbnail_thread.all_finished.connect(_on_thumb_done)
         self.thumbnail_thread.start()
 
