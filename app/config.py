@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "Multi Downloader"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 ORGANIZATION = "Antigravity Engineering"
 
 
@@ -61,7 +61,7 @@ DEFAULT_MAX_RETRIES = 3
 SEGMENT_CONNECTIONS_OPTIONS = ("AUTO", "1", "2", "4", "8", "16", "32")
 DEFAULT_SEGMENT_CONNECTIONS = "AUTO"
 
-CHANNEL_FETCH_RANGES = (25, 50, 75, 100, 150, 200, 300, 500, 1000, "All (Unlimited)")
+CHANNEL_FETCH_RANGES = ("1-10", "1-25", "20-30", "47-52", 25, 50, 100, 200, 500, "All (Unlimited)")
 DEFAULT_CHANNEL_FETCH_COUNT = 50
 
 ORDER_LATEST_TO_OLDEST = "Newest to Oldest"

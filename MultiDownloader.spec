@@ -1,7 +1,5 @@
-import os
-import sys
+# -*- mode: python ; coding: utf-8 -*-
 
-icon_file = os.path.join('app', 'assets', 'icon.ico') if sys.platform.startswith('win') else os.path.join('app', 'assets', 'AppIcon.icns')
 
 a = Analysis(
     ['main.py'],
@@ -34,7 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=icon_file if os.path.exists(icon_file) else None,
+    icon=['/Users/shaddo/Documents/antigravity/multimedia downloader/app/assets/AppIcon.icns'],
 )
 coll = COLLECT(
     exe,
@@ -48,6 +46,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='MultiDownloader.app',
-    icon=icon_file if os.path.exists(icon_file) else None,
+    icon='/Users/shaddo/Documents/antigravity/multimedia downloader/app/assets/AppIcon.icns',
     bundle_identifier=None,
 )

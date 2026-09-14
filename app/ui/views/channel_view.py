@@ -358,11 +358,11 @@ class ChannelView(QWidget):
         layout.setSpacing(14)
 
         # Header
-        lbl_title = QLabel("Channel & Media Downloader Pro v3.0")
+        lbl_title = QLabel("Channel & Media Downloader Pro v3.1")
         lbl_title.setStyleSheet("font-size: 22px; font-weight: 700; color: #ffffff;")
         lbl_sub = QLabel(
-            "Unified YouTube data extractor with Custom Data Selection, Forced 5-Tier Discovery Cascade, "
-            "Video Quality Selection, Dynamic Sorting (New/Old), and Correct V-Numbering."
+            "Unified YouTube data extractor with Custom Data Selection, Chronological V1..Vn Order (Oldest to Newest & Newest to Oldest), "
+            "Custom V-Ranges (e.g. 1-10, 1-25, 20-30, 47-52), Forced 5-Tier Discovery Cascade, and Unified Asset Packaging."
         )
         lbl_sub.setWordWrap(True)
         lbl_sub.setStyleSheet("color: #9d9da8;")
@@ -392,9 +392,10 @@ class ChannelView(QWidget):
         self.combo_order.currentTextChanged.connect(self._on_order_changed)
         fetch_layout.addWidget(self.combo_order, 1, 1)
 
-        fetch_layout.addWidget(QLabel("Max Videos:"), 1, 2)
+        fetch_layout.addWidget(QLabel("Videos to Fetch:"), 1, 2)
         self.combo_count = QComboBox()
         self.combo_count.setEditable(True)
+        self.combo_count.setToolTip("Enter count (e.g. 50) or exact custom range (e.g. 1-10, 1-25, 20-30, 47-52, All)")
         for count in CHANNEL_FETCH_RANGES:
             self.combo_count.addItem(str(count), count)
         self.combo_count.setCurrentText(str(DEFAULT_CHANNEL_FETCH_COUNT))
@@ -625,7 +626,7 @@ class ChannelView(QWidget):
         range_bar.addWidget(lbl_range)
 
         self.txt_v_range = QLineEdit()
-        self.txt_v_range.setPlaceholderText("e.g. V1-V10, V20 to V30, V5, 1-15, all")
+        self.txt_v_range.setPlaceholderText("e.g. 1-10, 1-25, 20-30, 47-52, V1, V5, V10, all")
         self.txt_v_range.returnPressed.connect(self._apply_v_range_clicked)
         range_bar.addWidget(self.txt_v_range)
 
@@ -633,18 +634,22 @@ class ChannelView(QWidget):
         self.btn_apply_range.clicked.connect(self._apply_v_range_clicked)
         range_bar.addWidget(self.btn_apply_range)
 
-        # Preset range buttons
-        btn_r10 = QPushButton("V1-V10")
-        btn_r10.clicked.connect(lambda: self._select_range_preset("V1-V10"))
+        # Preset range buttons matching user requirements
+        btn_r10 = QPushButton("1-10")
+        btn_r10.clicked.connect(lambda: self._select_range_preset("1-10"))
         range_bar.addWidget(btn_r10)
 
-        btn_r25 = QPushButton("V1-V25")
-        btn_r25.clicked.connect(lambda: self._select_range_preset("V1-V25"))
+        btn_r25 = QPushButton("1-25")
+        btn_r25.clicked.connect(lambda: self._select_range_preset("1-25"))
         range_bar.addWidget(btn_r25)
 
-        btn_r50 = QPushButton("V1-V50")
-        btn_r50.clicked.connect(lambda: self._select_range_preset("V1-V50"))
-        range_bar.addWidget(btn_r50)
+        btn_r2030 = QPushButton("20-30")
+        btn_r2030.clicked.connect(lambda: self._select_range_preset("20-30"))
+        range_bar.addWidget(btn_r2030)
+
+        btn_r4752 = QPushButton("47-52")
+        btn_r4752.clicked.connect(lambda: self._select_range_preset("47-52"))
+        range_bar.addWidget(btn_r4752)
 
         btn_r_all = QPushButton("Select All")
         btn_r_all.clicked.connect(self._select_all_candidates)
@@ -741,27 +746,34 @@ class ChannelView(QWidget):
         if d:
             self.txt_out_dir.setText(d)
 
-    def _get_selected_count(self) -> Optional[int]:
+    def _get_fetch_params(self) -> Tuple[Optional[int], Optional[Set[int]]]:
         val = self.combo_count.currentText().strip()
-        if not val or val.lower().startswith("all"):
-            return None
-        digits = "".join(filter(str.isdigit, val))
-        if digits:
-            return int(digits)
-        return DEFAULT_CHANNEL_FETCH_COUNT
+        return VRangeParser.parse_fetch_query(val)
+
+    def _get_selected_count(self) -> Optional[int]:
+        count, _ = self._get_fetch_params()
+        return count
 
     def _on_order_changed(self):
-        """Dynamic Re-sorting: switches order (New/Old) and correctly re-numbers V1..Vn."""
+        """Dynamic order switch: re-fetches channel so genuine oldest or newest uploads are loaded as V1."""
+        order = self.combo_order.currentText()
         if not self.candidates:
             return
-        order = self.combo_order.currentText()
-        self.candidates = ChannelFetcher.sort_candidates(self.candidates, order)
-        self._populate_table()
-        self._update_range_status()
-        self.lbl_table_status.setText(f"Re-sorted {len(self.candidates)} videos to {order}. V1 is now the first video in this order.")
+        url = self.txt_url.text().strip()
+        if self.fetch_thread and self.fetch_thread.isRunning():
+            return
+
+        if url:
+            self.lbl_table_status.setText(f"Switching order to {order}... fetching videos.")
+            self._fetch_videos_clicked()
+        else:
+            self.candidates = ChannelFetcher.sort_candidates(self.candidates, order)
+            self._populate_table()
+            self._update_range_status()
+            self.lbl_table_status.setText(f"Re-sorted {len(self.candidates)} videos to {order}. V1 is now the first video in this order.")
 
     def _apply_v_range_clicked(self):
-        """Applies V-Number range e.g. 'V1-V10', 'V20 to V30', 'V1, V5, V10', '1-15'."""
+        """Applies V-Number range e.g. '1-10', '1-25', '20-30', '47-52', 'V1-V10', 'V20 to V30', 'V1, V5, V10'."""
         query = self.txt_v_range.text().strip()
         if not query:
             return
@@ -774,7 +786,7 @@ class ChannelView(QWidget):
             QMessageBox.warning(
                 self,
                 "Invalid Range",
-                f"Could not parse range '{query}'.\n\nExamples of valid formats:\n• V1-V10\n• V20 to V30\n• V1, V5, V10\n• 1-10, 15\n• all",
+                f"Could not parse range '{query}'.\n\nExamples of valid formats:\n• 1-10\n• 1-25\n• 20-30\n• 47-52\n• V1 to V10\n• V1, V5, V10\n• all",
             )
             return
 
@@ -872,7 +884,8 @@ class ChannelView(QWidget):
 
         self.btn_fetch.setEnabled(False)
         self.btn_stop_fetch.setEnabled(True)
-        count = self._get_selected_count()
+        count, auto_select_set = self._get_fetch_params()
+        self._pending_auto_select_set = auto_select_set
         order = self.combo_order.currentText()
         count_label = f"{count} videos" if count else "All (Unlimited) videos"
         self.lbl_table_status.setText(f"Fetching {count_label} in {order} order...")
@@ -929,6 +942,18 @@ class ChannelView(QWidget):
         self.btn_stop_fetch.setEnabled(False)
         self.candidates = candidates
         order = self.combo_order.currentText()
+
+        # Apply pending auto-selection if range/count was specified
+        pending = getattr(self, "_pending_auto_select_set", None)
+        if pending is not None:
+            for cand in self.candidates:
+                cand.is_selected = (cand.version_num in pending)
+            self.txt_v_range.setText(VRangeParser.format_set(pending))
+            self._pending_auto_select_set = None
+        else:
+            for cand in self.candidates:
+                cand.is_selected = True
+
         self.lbl_table_status.setText(f"Loaded {len(candidates)} videos ({order}: V1 is the first video).")
         self._populate_table()
         self._update_range_status()

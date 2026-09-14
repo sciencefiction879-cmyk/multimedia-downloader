@@ -69,8 +69,28 @@ class ChannelCandidate:
         )
 
 
+import json
+import urllib.request
+
+
+def _parse_duration_to_sec(dur_str: str) -> float:
+    if not dur_str:
+        return 0.0
+    parts = dur_str.strip().split(":")
+    try:
+        if len(parts) == 3:
+            return float(int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2]))
+        elif len(parts) == 2:
+            return float(int(parts[0]) * 60 + int(parts[1]))
+        elif len(parts) == 1:
+            return float(int(parts[0]))
+    except Exception:
+        return 0.0
+    return 0.0
+
+
 class ChannelFetcher:
-    """Fetches video lists from YouTube channels or playlists with New-to-Old V1..Vn assignment."""
+    """Fetches video lists from YouTube channels or playlists with accurate V1..Vn assignment."""
 
     def __init__(self):
         self.ydl_opts = {
@@ -92,11 +112,6 @@ class ChannelFetcher:
         order: str = ORDER_LATEST_TO_OLDEST,
     ) -> List[ChannelCandidate]:
         logger.info(f"Fetching channel/playlist videos from: {url} (max: {max_results}, order: {order})")
-        opts = dict(self.ydl_opts)
-        if max_results is not None and int(max_results) > 0:
-            opts["playlistend"] = int(max_results)
-        else:
-            opts.pop("playlistend", None)
 
         # Reset channel info
         self.channel_name = ""
@@ -104,13 +119,60 @@ class ChannelFetcher:
         self.banner_url = ""
         self.logo_url = ""
 
-        # Ensure correct channel tab URL if generic channel link
+        # Normalize channel URL
         target_url = url.strip()
-        if (
-            ("youtube.com/@" in target_url or "youtube.com/c/" in target_url or "youtube.com/channel/" in target_url)
-            and not any(tab in target_url for tab in ["/videos", "/shorts", "/playlists", "/streams"])
-        ):
+        is_channel_url = any(k in target_url for k in ("youtube.com/@", "youtube.com/c/", "youtube.com/channel/", "youtube.com/user/"))
+        if is_channel_url and not any(tab in target_url for tab in ["/videos", "/shorts", "/playlists", "/streams"]):
             target_url = target_url.rstrip("/") + "/videos"
+
+        # -----------------------------------------------------------------
+        # 1. If ORDER_OLDEST_TO_LATEST requested on a channel:
+        #    Use YouTube Innertube "Oldest" chip so V1 is genuinely the oldest video!
+        # -----------------------------------------------------------------
+        if order == ORDER_OLDEST_TO_LATEST and is_channel_url:
+            try:
+                # Fast resolve channel metadata (id, name, banner, logo)
+                c_id, c_name, c_url, b_url, l_url = self._resolve_channel_metadata(target_url)
+                if c_name:
+                    self.channel_name = c_name
+                if c_url:
+                    self.channel_url = c_url
+                if b_url:
+                    self.banner_url = b_url
+                if l_url:
+                    self.logo_url = l_url
+
+                if c_id:
+                    oldest_candidates = self._fetch_channel_oldest_innertube(
+                        channel_id=c_id,
+                        channel_name=self.channel_name,
+                        channel_url=self.channel_url,
+                        max_results=max_results,
+                    )
+                    if oldest_candidates:
+                        logger.info(
+                            f"Successfully fetched {len(oldest_candidates)} true oldest videos via Innertube "
+                            f"(V1: {oldest_candidates[0].title})."
+                        )
+                        return oldest_candidates
+            except Exception as e:
+                logger.warning(f"Innertube oldest fetch fallback to yt-dlp: {e}")
+
+        # -----------------------------------------------------------------
+        # 2. Default yt-dlp fetch (used for Latest order, playlists, or fallback)
+        # -----------------------------------------------------------------
+        opts = dict(self.ydl_opts)
+        # Only cap yt-dlp playlistend if latest order (for oldest order we need all to reverse if falling back)
+        if order == ORDER_LATEST_TO_OLDEST and max_results is not None and int(max_results) > 0:
+            opts["playlistend"] = int(max_results)
+        elif order == ORDER_OLDEST_TO_LATEST:
+            # If falling back for oldest order on yt-dlp, extract up to max_results or 200 to safely reverse
+            if max_results is not None and int(max_results) > 0:
+                opts["playlistend"] = max(int(max_results) * 2, 100)
+            else:
+                opts.pop("playlistend", None)
+        else:
+            opts.pop("playlistend", None)
 
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
@@ -123,31 +185,33 @@ class ChannelFetcher:
             return []
 
         # Extract channel-level metadata
-        self.channel_name = info.get("channel") or info.get("uploader") or ""
-        self.channel_url = info.get("channel_url") or info.get("uploader_url") or self.channel_url
+        if not self.channel_name:
+            self.channel_name = info.get("channel") or info.get("uploader") or ""
+        if not self.channel_url:
+            self.channel_url = info.get("channel_url") or info.get("uploader_url") or self.channel_url
 
-        # Parse banner and logo URLs from channel thumbnails
-        thumbnails = info.get("thumbnails", [])
-        banner_cands = []
-        avatar_cands = []
-        for t in thumbnails:
-            t_id = str(t.get("id") or "").lower()
-            t_url = t.get("url")
-            if not t_url:
-                continue
-            w = t.get("width") or 0
-            h = t.get("height") or 0
-            if "banner" in t_id or (w and h and (w / h) > 2.2):
-                banner_cands.append((w, t_url))
-            if "avatar" in t_id or (w and h and 0.95 <= (w / h) <= 1.05):
-                avatar_cands.append((w, t_url))
+        if not self.banner_url or not self.logo_url:
+            thumbnails = info.get("thumbnails", [])
+            banner_cands = []
+            avatar_cands = []
+            for t in thumbnails:
+                t_id = str(t.get("id") or "").lower()
+                t_url = t.get("url")
+                if not t_url:
+                    continue
+                w = t.get("width") or 0
+                h = t.get("height") or 0
+                if "banner" in t_id or (w and h and (w / h) > 2.2):
+                    banner_cands.append((w, t_url))
+                if "avatar" in t_id or (w and h and 0.95 <= (w / h) <= 1.05):
+                    avatar_cands.append((w, t_url))
 
-        if banner_cands:
-            banner_cands.sort(key=lambda x: x[0], reverse=True)
-            self.banner_url = banner_cands[0][1]
-        if avatar_cands:
-            avatar_cands.sort(key=lambda x: x[0], reverse=True)
-            self.logo_url = avatar_cands[0][1]
+            if banner_cands and not self.banner_url:
+                banner_cands.sort(key=lambda x: x[0], reverse=True)
+                self.banner_url = banner_cands[0][1]
+            if avatar_cands and not self.logo_url:
+                avatar_cands.sort(key=lambda x: x[0], reverse=True)
+                self.logo_url = avatar_cands[0][1]
 
         entries = []
         if "entries" in info:
@@ -168,19 +232,207 @@ class ChannelFetcher:
 
         # Apply sorting:
         self.sort_candidates(candidates, order=order)
+
+        if max_results and len(candidates) > int(max_results):
+            candidates = candidates[: int(max_results)]
+            self.reassign_version_labels(candidates)
+
         logger.info(f"Successfully loaded {len(candidates)} video candidates with V1..V{len(candidates)} sequencing.")
+        return candidates
+
+    def _resolve_channel_metadata(self, channel_url: str):
+        """Quickly resolves channel ID, name, URL, banner, and logo via yt-dlp."""
+        opts = {
+            "extract_flat": True,
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "playlistend": 1,
+        }
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(channel_url, download=False) or {}
+            c_id = info.get("channel_id") or info.get("id") or ""
+            c_name = info.get("channel") or info.get("uploader") or ""
+            c_url = info.get("channel_url") or info.get("uploader_url") or channel_url
+
+            banner_url = ""
+            logo_url = ""
+            for t in info.get("thumbnails", []):
+                t_id = str(t.get("id") or "").lower()
+                t_url = t.get("url")
+                if not t_url:
+                    continue
+                w = t.get("width") or 0
+                h = t.get("height") or 0
+                if "banner" in t_id or (w and h and (w / h) > 2.2):
+                    if not banner_url:
+                        banner_url = t_url
+                if "avatar" in t_id or (w and h and 0.95 <= (w / h) <= 1.05):
+                    if not logo_url:
+                        logo_url = t_url
+
+            return c_id, c_name, c_url, banner_url, logo_url
+
+    def _fetch_channel_oldest_innertube(
+        self,
+        channel_id: str,
+        channel_name: str,
+        channel_url: str,
+        max_results: Optional[int] = None,
+    ) -> List[ChannelCandidate]:
+        """
+        Uses YouTube's official Innertube 'Oldest' browse chip to retrieve the channel's
+        true chronological oldest uploads, guaranteeing V1 is the channel's first video ever uploaded.
+        """
+        url = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            ),
+        }
+
+        # 1. Fetch Videos tab browse payload
+        payload1 = {
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20240901.00.00",
+                    "hl": "en",
+                    "gl": "US",
+                }
+            },
+            "browseId": channel_id,
+            "params": "EgZ2aWRlb3PyBgQKAjoA",
+        }
+        req1 = urllib.request.Request(url, data=json.dumps(payload1).encode("utf-8"), headers=headers)
+        try:
+            with urllib.request.urlopen(req1, timeout=15) as resp:
+                res1 = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            logger.debug(f"Innertube videos tab request failed: {e}")
+            return []
+
+        # 2. Find Oldest chip continuation token
+        oldest_token = None
+        tabs = res1.get("contents", {}).get("twoColumnBrowseResultsRenderer", {}).get("tabs", [])
+        for tab in tabs:
+            tab_r = tab.get("tabRenderer", {})
+            chips = tab_r.get("content", {}).get("richGridRenderer", {}).get("header", {}).get("chipBarViewModel", {}).get("chips", [])
+            for c in chips:
+                vm = c.get("chipViewModel", {})
+                if vm.get("text", "").strip().lower() == "oldest":
+                    oldest_token = (
+                        vm.get("tapCommand", {})
+                        .get("innertubeCommand", {})
+                        .get("continuationCommand", {})
+                        .get("token")
+                    )
+                    break
+            if oldest_token:
+                break
+
+        if not oldest_token:
+            logger.debug("No 'Oldest' chip continuation token in YouTube response.")
+            return []
+
+        candidates: List[ChannelCandidate] = []
+        token = oldest_token
+        seen_ids = set()
+
+        while token and (max_results is None or len(candidates) < max_results):
+            payload = {
+                "context": {
+                    "client": {
+                        "clientName": "WEB",
+                        "clientVersion": "2.20240901.00.00",
+                        "hl": "en",
+                        "gl": "US",
+                    }
+                },
+                "continuation": token,
+            }
+            req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    res = json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                logger.debug(f"Innertube oldest continuation failed: {e}")
+                break
+
+            next_token = None
+            actions = res.get("onResponseReceivedActions", [])
+            for act in actions:
+                cmd = act.get("reloadContinuationItemsCommand") or act.get("appendContinuationItemsAction") or {}
+                for item in cmd.get("continuationItems", []):
+                    if "richItemRenderer" in item:
+                        rir_content = item["richItemRenderer"].get("content", {})
+                        lum = rir_content.get("lockupViewModel", {})
+                        cid = lum.get("contentId")
+                        meta = lum.get("metadata", {}).get("lockupMetadataViewModel", {})
+                        title = meta.get("title", {}).get("content") or "Untitled Video"
+
+                        # Extract duration string
+                        dur_str = "00:00"
+                        badges = lum.get("contentImage", {}).get("thumbnailViewModel", {}).get("overlays", [])
+                        for b in badges:
+                            badge_vm = b.get("thumbnailBottomOverlayViewModel", {}).get("badges", [])
+                            for tb in badge_vm:
+                                txt = tb.get("thumbnailBadgeViewModel", {}).get("text")
+                                if txt and any(ch.isdigit() for ch in txt):
+                                    dur_str = txt
+                                    break
+
+                        # Extract relative date or view count
+                        date_str = ""
+                        meta_rows = meta.get("metadata", {}).get("contentMetadataViewModel", {}).get("metadataRows", [])
+                        for r in meta_rows:
+                            for p in r.get("metadataParts", []):
+                                txt = p.get("text", {}).get("content", "")
+                                if "ago" in txt:
+                                    date_str = txt
+
+                        if cid and cid not in seen_ids:
+                            seen_ids.add(cid)
+                            idx = len(candidates) + 1
+                            cand = ChannelCandidate(
+                                video_id=cid,
+                                url=f"https://www.youtube.com/watch?v={cid}",
+                                title=title,
+                                duration=_parse_duration_to_sec(dur_str),
+                                duration_str=dur_str,
+                                upload_date=date_str,
+                                uploader=channel_name,
+                                channel_url=channel_url,
+                                thumbnail=f"https://i.ytimg.com/vi/{cid}/hqdefault.jpg",
+                                version_label=f"V{idx}",
+                                version_num=idx,
+                                original_index=idx,
+                            )
+                            candidates.append(cand)
+                            if max_results and len(candidates) >= max_results:
+                                break
+
+                    elif "continuationItemRenderer" in item:
+                        cir = item["continuationItemRenderer"]
+                        next_token = cir.get("continuationEndpoint", {}).get("continuationCommand", {}).get("token")
+
+            if max_results and len(candidates) >= max_results:
+                break
+            token = next_token
+
         return candidates
 
     @staticmethod
     def sort_candidates(candidates: List[ChannelCandidate], order: str = ORDER_LATEST_TO_OLDEST) -> List[ChannelCandidate]:
         """
-        Sorts candidates by chronological order:
-        - ORDER_LATEST_TO_OLDEST (Newest to Oldest): original YouTube /videos sequence (index 1 is newest).
-        - ORDER_OLDEST_TO_LATEST (Oldest to Newest): reversed sequence (index 1 is oldest).
-        Then dynamically updates V1, V2, V3... numbering.
+        Sorts candidates by chronological order and dynamically updates V1, V2, V3... numbering:
+        - ORDER_LATEST_TO_OLDEST (Newest to Oldest): index 1 is newest (V1=Newest).
+        - ORDER_OLDEST_TO_LATEST (Oldest to Newest): index 1 is oldest (V1=Oldest).
         """
         if order == ORDER_OLDEST_TO_LATEST:
-            candidates.sort(key=lambda c: c.original_index, reverse=True)
+            candidates.sort(key=lambda c: c.original_index, reverse=False)
         else:
             candidates.sort(key=lambda c: c.original_index, reverse=False)
 
@@ -193,3 +445,4 @@ class ChannelFetcher:
         for idx, cand in enumerate(candidates, start=1):
             cand.version_num = idx
             cand.version_label = f"V{idx}"
+
