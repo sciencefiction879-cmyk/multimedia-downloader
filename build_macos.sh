@@ -45,22 +45,9 @@ echo "-> Compiling macOS standalone .app bundle..."
 rm -rf "$DIR/build" "$DIR/dist"
 
 "$VENV_PYTHON" -m PyInstaller \
-    --name="MultiDownloader" \
-    --windowed \
-    --onedir \
-    --icon="$ICNS_FILE" \
-    --add-data="app/assets:app/assets" \
-    --hidden-import="yt_dlp" \
-    --hidden-import="youtube_transcript_api" \
-    --hidden-import="psutil" \
-    --hidden-import="pydantic" \
-    --hidden-import="app.downloader.speed_optimizer" \
-    --hidden-import="app.downloader.metadata_purifier" \
-    --hidden-import="app.downloader.channel_assets_fetcher" \
-    --hidden-import="app.utils.range_parser" \
     --noconfirm \
     --clean \
-    main.py
+    MultiDownloader.spec
 
 echo "-> Application bundle built at: dist/MultiDownloader.app"
 
