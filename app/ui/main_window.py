@@ -65,7 +65,8 @@ class MainWindow(QMainWindow):
         brand_row.addWidget(lbl_logo)
 
         lbl_app_name = QLabel(APP_NAME)
-        lbl_app_name.setStyleSheet("font-size: 16px; font-weight: 700; color: #ffffff;")
+        lbl_app_name.setObjectName("viewTitle")
+        lbl_app_name.setStyleSheet("font-size: 16px; font-weight: 700;")
         brand_row.addWidget(lbl_app_name)
         brand_row.addStretch()
         side_layout.addLayout(brand_row)
@@ -87,6 +88,13 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self.btn_settings)
 
         side_layout.addStretch()
+
+        # Quick Theme Toggle Switch (Dark / Light Mode)
+        self.btn_theme_toggle = QPushButton()
+        self.btn_theme_toggle.setObjectName("themeToggleBtn")
+        self._update_theme_toggle_btn()
+        self.btn_theme_toggle.clicked.connect(self._toggle_theme)
+        side_layout.addWidget(self.btn_theme_toggle)
 
         # Version label
         lbl_ver = QLabel(f"Version {APP_VERSION}")
@@ -116,6 +124,7 @@ class MainWindow(QMainWindow):
 
         # Connect view switch signals
         self.channel_view.switch_to_downloads_requested.connect(lambda: self._set_active_page(1))
+        self.settings_view.combo_theme.currentTextChanged.connect(self._on_settings_theme_changed)
 
         col_layout.addWidget(self.stacked_widget)
         root_layout.addWidget(main_col)
@@ -135,6 +144,30 @@ class MainWindow(QMainWindow):
         btn = self.btn_group.button(index)
         if btn:
             btn.setChecked(True)
+
+    def _update_theme_toggle_btn(self):
+        is_dark = self.settings.theme.lower() == "dark"
+        self.btn_theme_toggle.setText("☀️ Switch to Light Mode" if is_dark else "🌙 Switch to Dark Mode")
+        self.btn_theme_toggle.setToolTip("Toggle between Dark Mode and Light (White) Mode")
+
+    def _toggle_theme(self):
+        new_theme = "light" if self.settings.theme.lower() == "dark" else "dark"
+        self.settings.theme = new_theme
+        self.settings.save()
+        self._apply_theme()
+        self._update_theme_toggle_btn()
+        # Keep SettingsView in sync
+        self.settings_view.combo_theme.blockSignals(True)
+        self.settings_view.combo_theme.setCurrentText(new_theme.capitalize())
+        self.settings_view.combo_theme.blockSignals(False)
+
+    def _on_settings_theme_changed(self, text: str):
+        new_theme = text.lower()
+        if new_theme != self.settings.theme.lower():
+            self.settings.theme = new_theme
+            self.settings.save()
+            self._apply_theme()
+            self._update_theme_toggle_btn()
 
     def _apply_theme(self):
         self.setStyleSheet(get_stylesheet(self.settings.theme))

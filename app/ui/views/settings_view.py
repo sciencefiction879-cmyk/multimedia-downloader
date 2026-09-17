@@ -55,7 +55,8 @@ class SettingsView(QWidget):
 
         # Header
         lbl_title = QLabel("Settings & Preferences")
-        lbl_title.setStyleSheet("font-size: 22px; font-weight: 700; color: #ffffff;")
+        lbl_title.setObjectName("viewTitle")
+        lbl_title.setStyleSheet("font-size: 22px; font-weight: 700;")
         layout.addWidget(lbl_title)
 
         # Download Directories
@@ -84,21 +85,27 @@ class SettingsView(QWidget):
         p_layout = QGridLayout(box_perf)
         p_layout.setSpacing(10)
 
-        p_layout.addWidget(QLabel("Concurrent Downloads:"), 0, 0)
+        p_layout.addWidget(QLabel("General Concurrency:"), 0, 0)
         self.spin_concurrent = QSpinBox()
         self.spin_concurrent.setRange(MIN_CONCURRENT_DOWNLOADS, MAX_CONCURRENT_DOWNLOADS)
         self.spin_concurrent.setValue(self.settings.concurrent_downloads)
         p_layout.addWidget(self.spin_concurrent, 0, 1)
 
-        p_layout.addWidget(QLabel("Max Retries:"), 0, 2)
+        p_layout.addWidget(QLabel("Concurrent Audio Downloads:"), 0, 2)
+        self.spin_audio_concurrent = QSpinBox()
+        self.spin_audio_concurrent.setRange(1, 16)
+        self.spin_audio_concurrent.setValue(getattr(self.settings, "audio_concurrent_downloads", 3))
+        p_layout.addWidget(self.spin_audio_concurrent, 0, 3)
+
+        p_layout.addWidget(QLabel("Max Retries:"), 1, 0)
         self.spin_retries = QSpinBox()
         self.spin_retries.setRange(0, 10)
         self.spin_retries.setValue(self.settings.max_retries)
-        p_layout.addWidget(self.spin_retries, 0, 3)
+        p_layout.addWidget(self.spin_retries, 1, 1)
 
         self.chk_gpu = QCheckBox("Enable Hardware / GPU Acceleration (Apple VideoToolbox)")
         self.chk_gpu.setChecked(self.settings.gpu_acceleration)
-        p_layout.addWidget(self.chk_gpu, 1, 0, 1, 4)
+        p_layout.addWidget(self.chk_gpu, 2, 0, 1, 4)
 
         layout.addWidget(box_perf)
 
@@ -240,6 +247,7 @@ class SettingsView(QWidget):
         self.settings.audio_dir = self.txt_audio_dir.text().strip()
         self.settings.channels_dir = self.txt_chan_dir.text().strip()
         self.settings.concurrent_downloads = self.spin_concurrent.value()
+        self.settings.audio_concurrent_downloads = self.spin_audio_concurrent.value()
         self.settings.max_retries = self.spin_retries.value()
         self.settings.gpu_acceleration = self.chk_gpu.isChecked()
         self.settings.default_audio_format = self.combo_audio_fmt.currentText()

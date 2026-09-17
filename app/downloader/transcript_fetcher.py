@@ -179,25 +179,27 @@ class TranscriptFetcher:
             else:
                 transcript_list_obj = []
 
-            # Check manual or generated in requested languages first
+            # Priority 1: Check manual or generated English transcript tracks first
             for t in transcript_list_obj:
-                try:
-                    data = t.fetch()
-                    lines = []
-                    for item in data:
-                        text = getattr(item, "text", None) or (item.get("text", "") if isinstance(item, dict) else str(item))
-                        clean_line = text.strip()
-                        if clean_line:
-                            lines.append(clean_line)
-                    if lines:
-                        cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
-                        if cleaned:
-                            kind = "Manual" if not getattr(t, "is_generated", False) else "Auto-Generated"
-                            return cleaned, f"YouTube {kind} Captions ({getattr(t, 'language_code', 'en')})", None
-                except Exception:
-                    continue
+                lang_code = getattr(t, "language_code", "").lower()
+                if lang_code.startswith("en") or lang_code in languages:
+                    try:
+                        data = t.fetch()
+                        lines = []
+                        for item in data:
+                            text = getattr(item, "text", None) or (item.get("text", "") if isinstance(item, dict) else str(item))
+                            clean_line = text.strip()
+                            if clean_line:
+                                lines.append(clean_line)
+                        if lines:
+                            cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
+                            if cleaned:
+                                kind = "Manual" if not getattr(t, "is_generated", False) else "Auto-Generated"
+                                return cleaned, f"YouTube {kind} Captions ({getattr(t, 'language_code', 'en')})", None
+                    except Exception:
+                        continue
 
-            # Check auto-translate to English if foreign language transcript exists
+            # Priority 2: Check auto-translate to English if foreign language transcript exists
             for t in transcript_list_obj:
                 if getattr(t, "is_translatable", False):
                     try:
@@ -216,6 +218,24 @@ class TranscriptFetcher:
                                 return cleaned, f"Translated Captions (from {orig_lang} to English)", None
                     except Exception as e:
                         logger.debug(f"Translation failed for {video_id}: {e}")
+
+            # Priority 3: Fallback to ANY available native caption track rather than failing
+            for t in transcript_list_obj:
+                try:
+                    data = t.fetch()
+                    lines = []
+                    for item in data:
+                        text = getattr(item, "text", None) or (item.get("text", "") if isinstance(item, dict) else str(item))
+                        clean_line = text.strip()
+                        if clean_line:
+                            lines.append(clean_line)
+                    if lines:
+                        cleaned = TranscriptFetcher.clean_voiceover_script(" ".join(lines))
+                        if cleaned:
+                            orig_lang = getattr(t, "language", getattr(t, "language_code", "Original Language"))
+                            return cleaned, f"YouTube Native Captions ({orig_lang})", None
+                except Exception:
+                    continue
 
         except Exception as e:
             logger.debug(f"Transcript list inspection failed for {video_id}: {e}")

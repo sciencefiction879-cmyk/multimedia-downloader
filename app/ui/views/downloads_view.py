@@ -33,9 +33,9 @@ class DownloadsView(QWidget):
 
         col_titles = QVBoxLayout()
         lbl_title = QLabel("Downloads & Active Queue")
-        lbl_title.setStyleSheet("font-size: 22px; font-weight: 700; color: #ffffff;")
+        lbl_title.setObjectName("viewTitle")
         self.lbl_queue_count = QLabel("0 active items in queue")
-        self.lbl_queue_count.setStyleSheet("color: #9d9da8;")
+        self.lbl_queue_count.setObjectName("viewSubtitle")
         col_titles.addWidget(lbl_title)
         col_titles.addWidget(self.lbl_queue_count)
         top_row.addLayout(col_titles)

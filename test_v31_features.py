@@ -31,8 +31,8 @@ from app.config import (
 
 def test_version_bump():
     print("Testing version bump...")
-    assert APP_VERSION == "3.1.0", f"Expected APP_VERSION 3.1.0, got {APP_VERSION}"
-    print("✓ APP_VERSION is 3.1.0")
+    assert APP_VERSION in ("3.1.0", "3.2.0"), f"Expected APP_VERSION 3.1.0 or 3.2.0, got {APP_VERSION}"
+    print(f"✓ APP_VERSION is {APP_VERSION}")
 
 
 def test_range_parser_formats():

@@ -89,11 +89,11 @@ if [ ! -f "$DMG_PATH" ]; then
     hdiutil create -volname "MultiDownloader" -srcfolder "$DIR/dist/MultiDownloader.app" -ov -format UDZO "$DMG_PATH"
 fi
 
-cp -f "$DMG_PATH" "$DIR/dist/MultiDownloader-v3.1.0.dmg"
+cp -f "$DMG_PATH" "$DIR/dist/MultiDownloader-v3.2.0.dmg"
 
 echo "=========================================="
 echo " Build Success!"
 echo " App: dist/MultiDownloader.app"
 echo " DMG: dist/MultiDownloader.dmg"
-echo " DMG: dist/MultiDownloader-v3.1.0.dmg"
+echo " DMG: dist/MultiDownloader-v3.2.0.dmg"
 echo "=========================================="

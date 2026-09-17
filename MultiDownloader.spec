@@ -30,6 +30,7 @@ hiddenimports = [
     'app.utils.title_matcher',
     'app.utils.filename',
     'app.utils.logger',
+    'app.ui.dialogs.download_statistics_dialog',
 ]
 
 a = Analysis(
