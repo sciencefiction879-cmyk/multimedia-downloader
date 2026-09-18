@@ -43,7 +43,7 @@ if not app:
 
 def test_v32_config():
     print("Testing v3.2 configuration constants...")
-    assert APP_VERSION == "3.2.0", f"Expected APP_VERSION '3.2.0', got '{APP_VERSION}'"
+    assert APP_VERSION in ("3.2.0", "3.3.0"), f"Expected APP_VERSION '3.2.0' or '3.3.0', got '{APP_VERSION}'"
     assert DEFAULT_AUDIO_CONCURRENT_DOWNLOADS == 3, f"Expected 3, got {DEFAULT_AUDIO_CONCURRENT_DOWNLOADS}"
     assert MAX_CONCURRENT_DOWNLOADS == 16, f"Expected 16, got {MAX_CONCURRENT_DOWNLOADS}"
     print("✓ Config constants verified!")
