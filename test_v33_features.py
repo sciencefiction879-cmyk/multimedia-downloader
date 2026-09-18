@@ -33,7 +33,7 @@ if not app:
 
 def test_v33_version():
     print("Testing v3.3.0 version bump...")
-    assert APP_VERSION == "3.3.0", f"Expected '3.3.0', got '{APP_VERSION}'"
+    assert APP_VERSION in ("3.3.0", "3.4.0"), f"Expected '3.3.0' or '3.4.0', got '{APP_VERSION}'"
     print("✓ APP_VERSION is 3.3.0")
 
 
@@ -93,7 +93,8 @@ def test_channel_view_parallel_methods():
     assert view._parallel_state["media_done"] is False
 
     # Second item fails
-    view._on_parallel_media_failed(item2, "Network timeout")
+    with patch.object(view, "_show_diagnostics_report"):
+        view._on_parallel_media_failed(item2, "Network timeout")
     assert view._parallel_state["media_failed_count"] == 1
     # Both items accounted for -> media_done MUST be True!
     assert view._parallel_state["media_done"] is True

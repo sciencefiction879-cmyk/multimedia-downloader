@@ -43,6 +43,7 @@ class Settings:
 
     concurrent_downloads: int = DEFAULT_CONCURRENT_DOWNLOADS
     audio_concurrent_downloads: int = 3
+    script_concurrent_downloads: int = 3
     max_retries: int = DEFAULT_MAX_RETRIES
     segment_connections: str = "AUTO"
     gpu_acceleration: bool = True
@@ -74,6 +75,7 @@ class Settings:
                     s = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
                     s.concurrent_downloads = min(MAX_CONCURRENT_DOWNLOADS, max(MIN_CONCURRENT_DOWNLOADS, s.concurrent_downloads))
                     s.audio_concurrent_downloads = min(MAX_CONCURRENT_DOWNLOADS, max(MIN_CONCURRENT_DOWNLOADS, getattr(s, "audio_concurrent_downloads", 3)))
+                    s.script_concurrent_downloads = min(MAX_CONCURRENT_DOWNLOADS, max(MIN_CONCURRENT_DOWNLOADS, getattr(s, "script_concurrent_downloads", 3)))
                     return s
             except Exception:
                 pass

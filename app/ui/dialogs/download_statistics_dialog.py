@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
+from app.config import APP_VERSION
 
 
 class DownloadStatisticsDialog(QDialog):
@@ -233,7 +234,7 @@ class DownloadStatisticsDialog(QDialog):
     def _copy_diagnostic_report(self):
         report = [
             "==================================================",
-            " MultiDownloader v3.2.0 - Download Statistics Report",
+            f" MultiDownloader v{APP_VERSION} - Download Statistics Report",
             "==================================================",
             f"Total Videos: {self.stats.get('total_videos', 0)}",
             f"Succeeded: {self.stats.get('total_succeeded', 0)}",
