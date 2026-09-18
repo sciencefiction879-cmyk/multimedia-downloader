@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import threading
 from queue import Queue
 from pathlib import Path
@@ -45,6 +46,7 @@ from app.config import (
     DEFAULT_AUDIO_QUALITY,
     DEFAULT_AUDIO_CONCURRENT_DOWNLOADS,
     DEFAULT_SCRIPT_CONCURRENT_DOWNLOADS,
+    MAX_CONCURRENT_DOWNLOADS,
     VIDEO_FORMATS,
     VIDEO_QUALITIES,
     DEFAULT_VIDEO_QUALITY,
@@ -54,6 +56,8 @@ from app.config import (
     DEFAULT_CHANNEL_FETCH_COUNT,
     ORDER_LATEST_TO_OLDEST,
     ORDER_OLDEST_TO_LATEST,
+    ORDER_POPULAR_TO_LEAST,
+    ORDER_LEAST_TO_POPULAR,
 )
 from app.downloader.channel_fetcher import ChannelFetcher, ChannelCandidate
 from app.downloader.transcript_fetcher import TranscriptFetcher
@@ -116,15 +120,32 @@ class ScriptViewerDialog(QDialog):
         layout.addLayout(btn_row)
 
 
+class SummaryFetchThread(QThread):
+    summary_ready = Signal(dict)
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url.strip()
+
+    def run(self):
+        try:
+            fetcher = ChannelFetcher()
+            summary = fetcher.fetch_channel_summary(self.url)
+            self.summary_ready.emit(summary)
+        except Exception:
+            pass
+
+
 class MediaFetchThread(QThread):
     finished_signal = Signal(list)
     error_signal = Signal(str)
 
-    def __init__(self, url: str, max_count: Optional[int], order: str):
+    def __init__(self, url: str, max_count: Optional[int], order: str, force_refresh: bool = False):
         super().__init__()
         self.url = url.strip()
         self.max_count = max_count
         self.order = order
+        self.force_refresh = force_refresh
         self._is_cancelled = False
 
     def cancel(self):
@@ -148,7 +169,12 @@ class MediaFetchThread(QThread):
                     return
 
             fetcher = ChannelFetcher()
-            candidates = fetcher.fetch_channel_videos(self.url, max_results=self.max_count, order=self.order)
+            candidates = fetcher.fetch_channel_videos(
+                self.url,
+                max_results=self.max_count,
+                order=self.order,
+                force_refresh=self.force_refresh,
+            )
             if not self._is_cancelled:
                 self.finished_signal.emit(candidates)
         except Exception as e:
@@ -174,7 +200,7 @@ class BatchTranscriptThread(QThread):
         self.candidates = candidates
         self.existing_transcripts = existing_transcripts or {}
         self.output_dir = output_dir
-        self.concurrency = max(1, min(16, concurrency))
+        self.concurrency = max(1, min(MAX_CONCURRENT_DOWNLOADS, concurrency))
         self._is_cancelled = False
 
     def cancel(self):
@@ -208,28 +234,29 @@ class BatchTranscriptThread(QThread):
 
                 # 1. In-memory check
                 if cand.video_id in self.existing_transcripts and self.existing_transcripts[cand.video_id]:
-                    with lock:
-                        skip_count += 1
-                        completed_items += 1
-                        cur_comp = completed_items
-                        cur_done = done_count
-                        cur_skip = skip_count
-                    self.progress_signal.emit(cur_comp, total, f"[{v_label}] (Resumed) {title}")
-                    self.item_progress.emit(cur_comp, total, cur_done, cur_skip, v_label, title)
-                    self.item_fetched.emit(cand.video_id, self.existing_transcripts[cand.video_id])
-                    if self.output_dir:
-                        disk_file = self.output_dir / f"{v_label} Script.txt"
-                        if not disk_file.exists() or disk_file.stat().st_size == 0:
-                            try:
-                                self.output_dir.mkdir(parents=True, exist_ok=True)
-                                formatted = TranscriptFetcher.format_script_with_metadata(
-                                    self.existing_transcripts[cand.video_id], v_label
-                                )
-                                disk_file.write_text(formatted, encoding="utf-8")
-                            except Exception:
-                                pass
-                    task_queue.task_done()
-                    continue
+                    mem_text = self.existing_transcripts[cand.video_id]
+                    is_val, _ = TranscriptFetcher.validate_script_content(mem_text)
+                    if is_val:
+                        with lock:
+                            skip_count += 1
+                            completed_items += 1
+                            cur_comp = completed_items
+                            cur_done = done_count
+                            cur_skip = skip_count
+                        self.progress_signal.emit(cur_comp, total, f"[{v_label}] (Resumed) {title}")
+                        self.item_progress.emit(cur_comp, total, cur_done, cur_skip, v_label, title)
+                        self.item_fetched.emit(cand.video_id, mem_text)
+                        if self.output_dir:
+                            disk_file = self.output_dir / f"{v_label} Script.txt"
+                            if not disk_file.exists() or disk_file.stat().st_size == 0:
+                                try:
+                                    self.output_dir.mkdir(parents=True, exist_ok=True)
+                                    formatted = TranscriptFetcher.format_script_with_metadata(mem_text, v_label)
+                                    disk_file.write_text(formatted, encoding="utf-8")
+                                except Exception:
+                                    pass
+                        task_queue.task_done()
+                        continue
 
                 # 2. Disk check (Instant resume)
                 if self.output_dir:
@@ -238,7 +265,8 @@ class BatchTranscriptThread(QThread):
                         try:
                             with open(disk_file, "r", encoding="utf-8") as f:
                                 saved_text = f.read()
-                            if saved_text and not saved_text.startswith("[No transcript"):
+                            is_val, _ = TranscriptFetcher.validate_script_content(saved_text)
+                            if is_val:
                                 with lock:
                                     skip_count += 1
                                     completed_items += 1
@@ -254,28 +282,48 @@ class BatchTranscriptThread(QThread):
                             pass
 
                 self.progress_signal.emit(completed_items + 1, total, f"[{v_label}] Downloading: {title}")
-                try:
-                    text, method, diag = TranscriptFetcher.fetch_video_transcript_with_diagnostics(cand.video_id)
-                    if text:
-                        with lock:
-                            done_count += 1
-                        self.item_fetched.emit(cand.video_id, text)
-                        self.item_diagnostics.emit(cand.video_id, method, "")
-                        # Live Saving immediately to disk as each item is retrieved
-                        if self.output_dir:
-                            try:
-                                self.output_dir.mkdir(parents=True, exist_ok=True)
-                                disk_file = self.output_dir / f"{v_label} Script.txt"
-                                formatted = TranscriptFetcher.format_script_with_metadata(text, v_label)
-                                with open(disk_file, "w", encoding="utf-8") as f:
-                                    f.write(formatted)
-                            except Exception as e:
-                                logger.debug(f"Live script save failed for {v_label}: {e}")
-                    else:
-                        self.item_diagnostics.emit(cand.video_id, method, diag or "")
-                except Exception as e:
-                    logger.debug(f"Transcript fetch error for {cand.video_id}: {e}")
-                    self.item_diagnostics.emit(cand.video_id, "Error", str(e))
+
+                valid_text = None
+                last_method = ""
+                last_diag = ""
+                for attempt in range(1, 6):
+                    if self._is_cancelled:
+                        break
+                    try:
+                        t_text, t_method, t_diag = TranscriptFetcher.fetch_video_transcript_with_diagnostics(cand.video_id)
+                        last_method = t_method
+                        last_diag = t_diag or ""
+                        is_valid, reason = TranscriptFetcher.validate_script_content(t_text)
+                        if is_valid:
+                            valid_text = t_text
+                            break
+                        else:
+                            last_diag = f"Attempt {attempt}/5: {reason}"
+                            if attempt < 5:
+                                threading.Event().wait(0.3)
+                    except Exception as e:
+                        last_method = "Error"
+                        last_diag = f"Attempt {attempt}/5 error: {e}"
+                        if attempt < 5:
+                            threading.Event().wait(0.3)
+
+                if valid_text:
+                    with lock:
+                        done_count += 1
+                    self.item_fetched.emit(cand.video_id, valid_text)
+                    self.item_diagnostics.emit(cand.video_id, last_method, "")
+                    # Live Saving immediately to disk as each item is retrieved
+                    if self.output_dir:
+                        try:
+                            self.output_dir.mkdir(parents=True, exist_ok=True)
+                            disk_file = self.output_dir / f"{v_label} Script.txt"
+                            formatted = TranscriptFetcher.format_script_with_metadata(valid_text, v_label)
+                            with open(disk_file, "w", encoding="utf-8") as f:
+                                f.write(formatted)
+                        except Exception as e:
+                            logger.debug(f"Live script save failed for {v_label}: {e}")
+                else:
+                    self.item_diagnostics.emit(cand.video_id, last_method or "Validation Failed", last_diag or "Script was empty or invalid after 5 retries")
 
                 with lock:
                     completed_items += 1
@@ -396,13 +444,25 @@ class BatchThumbnailThread(QThread):
                 skip_count += 1
                 saved.append(out_file)
             else:
-                saved_path = ChannelAssetsFetcher.download_thumbnail_for_video(
-                    video_id=cand.video_id,
-                    version_label=v_label,
-                    output_dir=output_dir,
-                    fallback_thumb_url=cand.thumbnail,
-                )
-                if saved_path:
+                saved_path = None
+                for attempt in range(1, 6):
+                    if self._is_cancelled:
+                        break
+                    try:
+                        res = ChannelAssetsFetcher.download_thumbnail_for_video(
+                            video_id=cand.video_id,
+                            version_label=v_label,
+                            output_dir=output_dir,
+                            fallback_thumb_url=cand.thumbnail,
+                        )
+                        if res and Path(res).exists() and Path(res).stat().st_size > 1024:
+                            saved_path = res
+                            break
+                    except Exception:
+                        if attempt < 5:
+                            threading.Event().wait(0.3)
+
+                if saved_path and Path(saved_path).exists() and Path(saved_path).stat().st_size > 1024:
                     saved.append(saved_path)
                     done_count += 1
 
@@ -425,19 +485,27 @@ class ChannelAssetsThread(QThread):
         self.logo_url = logo_url
 
     def run(self):
-        try:
-            res = ChannelAssetsFetcher.download_channel_assets(
-                channel_url=self.channel_url,
-                output_dir=self.output_dir,
-                banner_url=self.banner_url,
-                logo_url=self.logo_url,
-            )
-            saved_list = list(res.values()) if isinstance(res, dict) else []
-            self.finished_signal.emit(res if isinstance(res, dict) else {})
-            self.all_finished.emit(True, saved_list)
-        except Exception as e:
-            self.error_signal.emit(str(e))
-            self.all_finished.emit(False, [])
+        res = None
+        for attempt in range(1, 6):
+            try:
+                res = ChannelAssetsFetcher.download_channel_assets(
+                    channel_url=self.channel_url,
+                    output_dir=self.output_dir,
+                    banner_url=self.banner_url,
+                    logo_url=self.logo_url,
+                )
+                if res:
+                    break
+            except Exception as e:
+                if attempt >= 5:
+                    self.error_signal.emit(str(e))
+                    self.all_finished.emit(False, [])
+                    return
+                threading.Event().wait(0.3)
+
+        saved_list = list(res.values()) if isinstance(res, dict) else []
+        self.finished_signal.emit(res if isinstance(res, dict) else {})
+        self.all_finished.emit(True, saved_list)
 
 
 class ChannelView(QWidget):
@@ -479,12 +547,11 @@ class ChannelView(QWidget):
         layout.setSpacing(14)
 
         # Header
-        lbl_title = QLabel("Channel & Media Downloader Pro v3.4")
+        lbl_title = QLabel("Channel & Media Downloader Pro v3.5")
         lbl_title.setObjectName("viewTitle")
         lbl_sub = QLabel(
-            "Unified YouTube data extractor with Chronological V-Numbering (Oldest to Newest & Newest to Oldest), "
-            "Custom V-Ranges (e.g. 1-10, 1-25, 20-30, 47-52), Strict Sequential Phased Pipeline "
-            "(1. Titles → 2. Thumbnails → 3. Channel Assets → 4. Scripts → 5. Audio), Real-time Live Saving to Disk, and Full Failure Diagnostics."
+            "Unified YouTube data extractor with Chronological & Popularity V-Numbering (Newest, Oldest, Most Popular, Least Popular), "
+            "Selective V-Range Skip & Download, Zero Competitor Word-Count Scripts, 5-Retry Auto Recovery, and Concurrent Scripts & Audio."
         )
         lbl_sub.setWordWrap(True)
         lbl_sub.setObjectName("viewSubtitle")
@@ -501,7 +568,11 @@ class ChannelView(QWidget):
         fetch_layout.addWidget(QLabel("YouTube URL:"), 0, 0)
         self.txt_url = QLineEdit()
         self.txt_url.setPlaceholderText("Paste Channel link (@Channel/videos), Playlist, or Video URL here...")
-        fetch_layout.addWidget(self.txt_url, 0, 1, 1, 3)
+        fetch_layout.addWidget(self.txt_url, 0, 1, 1, 2)
+
+        self.lbl_total_available_videos = QLabel("Channel Videos: —")
+        self.lbl_total_available_videos.setStyleSheet("color: #007aff; font-weight: 700; font-size: 12px;")
+        fetch_layout.addWidget(self.lbl_total_available_videos, 0, 3)
 
         btn_paste = QPushButton("📋 Paste")
         btn_paste.clicked.connect(lambda: self.txt_url.setText(QApplication.clipboard().text().strip()))
@@ -523,13 +594,18 @@ class ChannelView(QWidget):
         self.combo_count.setCurrentText(str(DEFAULT_CHANNEL_FETCH_COUNT))
         fetch_layout.addWidget(self.combo_count, 1, 3)
 
-        # Action button row: Fetch, Stop Fetch, Clear
+        # Action button row: Fetch, Force Fetch, Stop, Clear
         fetch_btn_row = QHBoxLayout()
         fetch_btn_row.setSpacing(6)
 
         self.btn_fetch = QPushButton("🔍 Fetch Videos")
         self.btn_fetch.setObjectName("primaryBtn")
         self.btn_fetch.clicked.connect(self._fetch_videos_clicked)
+
+        self.btn_force_fetch = QPushButton("⚡ Force Fetch")
+        self.btn_force_fetch.setToolTip("Bypasses any cache to extract completely fresh videos and data")
+        self.btn_force_fetch.setStyleSheet("background-color: #5856d6; color: #ffffff; font-weight: 700;")
+        self.btn_force_fetch.clicked.connect(self._force_fetch_videos_clicked)
 
         self.btn_stop_fetch = QPushButton("⏹ Stop")
         self.btn_stop_fetch.setEnabled(False)
@@ -539,33 +615,65 @@ class ChannelView(QWidget):
         self.btn_clear_all.clicked.connect(self._clear_all_clicked)
 
         fetch_btn_row.addWidget(self.btn_fetch)
+        fetch_btn_row.addWidget(self.btn_force_fetch)
         fetch_btn_row.addWidget(self.btn_stop_fetch)
         fetch_btn_row.addWidget(self.btn_clear_all)
         fetch_layout.addLayout(fetch_btn_row, 1, 4)
 
+        # Auto-fetch debounced timer
+        self.auto_fetch_timer = QTimer(self)
+        self.auto_fetch_timer.setSingleShot(True)
+        self.auto_fetch_timer.setInterval(800)
+        self.auto_fetch_timer.timeout.connect(self._on_auto_fetch_timeout)
+        self.txt_url.textChanged.connect(self._on_url_text_changed)
+
         layout.addWidget(box_fetch)
 
         # -------------------------------------------------------------
-        # 2. Custom Data Selection Panel (Requirement 1 & 2)
+        # 2. Custom Data Selection Panel (Requirement 1, 2, 3, 4, 8)
         # -------------------------------------------------------------
-        box_selection = QGroupBox("2. Custom Data Selection (Sequential Phased Pipeline)")
+        box_selection = QGroupBox("2. Custom Data Selection & Selective Download Pipeline")
         box_selection.setStyleSheet("QGroupBox { border: 1.5px solid #007aff; }")
         sel_layout = QVBoxLayout(box_selection)
         sel_layout.setSpacing(10)
 
-        lbl_sel_info = QLabel("Downloads execute in strict sequential phases (Titles → Thumbnails → Assets → Scripts → Audio), saved live in real-time:")
+        lbl_sel_info = QLabel("Sequential Phased Pipeline (Titles → Thumbnails → Assets → Parallel Scripts & Audio), saved live in real-time:")
         lbl_sel_info.setStyleSheet("color: #007aff; font-weight: 600;")
         sel_layout.addWidget(lbl_sel_info)
+
+        # Skip / Exclude Range Bar (Requirement 8)
+        skip_frame = QFrame()
+        skip_frame.setStyleSheet("background-color: rgba(255, 149, 0, 0.08); border-radius: 6px; padding: 4px;")
+        skip_layout = QHBoxLayout(skip_frame)
+        skip_layout.setContentsMargins(6, 4, 6, 4)
+        lbl_skip = QLabel("🚫 Skip / Already Downloaded V-Ranges:")
+        lbl_skip.setStyleSheet("color: #ff9500; font-weight: 700; font-size: 11px;")
+        self.txt_skip_ranges = QLineEdit()
+        self.txt_skip_ranges.setPlaceholderText("e.g. V1-V10, V25-V35, V1-V10 + V25-V35, V3, V8 (skipped across all downloads)")
+        self.txt_skip_ranges.setToolTip("V-numbers to skip completely from this download session")
+        skip_layout.addWidget(lbl_skip)
+        skip_layout.addWidget(self.txt_skip_ranges)
+        sel_layout.addWidget(skip_frame)
 
         # 6 Clean Selection Checkboxes organized in grid with custom controls
         grid_sel = QGridLayout()
         grid_sel.setSpacing(10)
 
-        # 1. Video Titles
-        self.chk_titles = QCheckBox("1. Video Titles (Single Titles.txt in root folder)")
+        # 1. Video Titles + Linked option
+        w_title = QWidget()
+        l_title = QVBoxLayout(w_title)
+        l_title.setContentsMargins(0, 0, 0, 0)
+        l_title.setSpacing(2)
+        self.chk_titles = QCheckBox("1. Video Titles (Titles.txt in folder)")
         self.chk_titles.setChecked(True)
-        self.chk_titles.setToolTip("Creates only one TXT file named Titles.txt containing V1 — Title, V2 — Title...")
-        grid_sel.addWidget(self.chk_titles, 0, 0)
+        self.chk_titles.setToolTip("Creates single TXT file named Titles.txt containing V1 — Title, V2 — Title...")
+        self.chk_titles_linked = QCheckBox("🔗 Only active script/audio videos in Titles.txt")
+        self.chk_titles_linked.setChecked(False)
+        self.chk_titles_linked.setStyleSheet("color: #8e8e93; font-size: 11px; margin-left: 20px;")
+        self.chk_titles_linked.setToolTip("When checked, Titles.txt only includes videos being actively downloaded in Scripts or Audio")
+        l_title.addWidget(self.chk_titles)
+        l_title.addWidget(self.chk_titles_linked)
+        grid_sel.addWidget(w_title, 0, 0)
 
         # 2. Thumbnails with custom total count
         w_thumb = QWidget()
@@ -594,48 +702,66 @@ class ChannelView(QWidget):
         self.chk_channel_assets.setToolTip("Competitor channel banner and avatar/logo images saved into Channel Assets/")
         grid_sel.addWidget(self.chk_channel_assets, 0, 2)
 
-        # 4. Scripts with custom parallel concurrency
+        # 4. Scripts with custom parallel concurrency and custom V-range
         w_script = QWidget()
-        l_script = QHBoxLayout(w_script)
+        l_script = QVBoxLayout(w_script)
         l_script.setContentsMargins(0, 0, 0, 0)
-        l_script.setSpacing(6)
+        l_script.setSpacing(3)
+
+        l_script_top = QHBoxLayout()
+        l_script_top.setSpacing(6)
         self.chk_scripts = QCheckBox("4. Scripts (Scripts/)")
         self.chk_scripts.setChecked(True)
-        self.chk_scripts.setToolTip("Active search across captions with custom parallel concurrency")
+        self.chk_scripts.setToolTip("Active search across captions with custom parallel concurrency (1-500)")
         self.lbl_script_conc = QLabel("⚡ Parallel:")
         self.lbl_script_conc.setStyleSheet("color: #007aff; font-weight: 600;")
         self.spin_script_concurrency = QSpinBox()
-        self.spin_script_concurrency.setRange(1, 16)
+        self.spin_script_concurrency.setRange(1, 500)
         initial_script_conc = getattr(self.settings, "script_concurrent_downloads", 3)
         self.spin_script_concurrency.setValue(initial_script_conc)
-        self.spin_script_concurrency.setToolTip("Custom select how many scripts download in parallel (default: 3)")
+        self.spin_script_concurrency.setToolTip("Custom select how many scripts download in parallel (up to 500)")
         self.spin_script_concurrency.valueChanged.connect(self._on_script_concurrency_changed)
-        l_script.addWidget(self.chk_scripts)
-        l_script.addWidget(self.lbl_script_conc)
-        l_script.addWidget(self.spin_script_concurrency)
-        l_script.addStretch()
+        l_script_top.addWidget(self.chk_scripts)
+        l_script_top.addWidget(self.lbl_script_conc)
+        l_script_top.addWidget(self.spin_script_concurrency)
+        l_script_top.addStretch()
+        l_script.addLayout(l_script_top)
+
+        self.txt_script_v_range = QLineEdit()
+        self.txt_script_v_range.setPlaceholderText("Custom Script Range (e.g. V11-V30, empty = all)")
+        self.txt_script_v_range.setStyleSheet("font-size: 11px;")
+        l_script.addWidget(self.txt_script_v_range)
         grid_sel.addWidget(w_script, 1, 0)
 
-        # 5. Audio with custom parallel concurrency
+        # 5. Audio with custom parallel concurrency and custom V-range
         w_audio = QWidget()
-        l_audio = QHBoxLayout(w_audio)
+        l_audio = QVBoxLayout(w_audio)
         l_audio.setContentsMargins(0, 0, 0, 0)
-        l_audio.setSpacing(6)
+        l_audio.setSpacing(3)
+
+        l_audio_top = QHBoxLayout()
+        l_audio_top.setSpacing(6)
         self.chk_mp3s = QCheckBox("5. Audio (Audio/)")
         self.chk_mp3s.setChecked(True)
-        self.chk_mp3s.setToolTip("Parallel MP3 audio downloads named V1.mp3, V2.mp3... saved into Audio/ folder")
+        self.chk_mp3s.setToolTip("Parallel MP3 audio downloads named V1.mp3, V2.mp3... (concurrency 1-500)")
         self.lbl_audio_conc = QLabel("⚡ Parallel:")
         self.lbl_audio_conc.setStyleSheet("color: #007aff; font-weight: 600;")
         self.spin_audio_concurrency = QSpinBox()
-        self.spin_audio_concurrency.setRange(1, 16)
+        self.spin_audio_concurrency.setRange(1, 500)
         initial_audio_conc = getattr(self.settings, "audio_concurrent_downloads", 3)
         self.spin_audio_concurrency.setValue(initial_audio_conc)
-        self.spin_audio_concurrency.setToolTip("Custom select how many audio files download in parallel (default: 3)")
+        self.spin_audio_concurrency.setToolTip("Custom select how many audio files download in parallel (up to 500)")
         self.spin_audio_concurrency.valueChanged.connect(self._on_audio_concurrency_changed)
-        l_audio.addWidget(self.chk_mp3s)
-        l_audio.addWidget(self.lbl_audio_conc)
-        l_audio.addWidget(self.spin_audio_concurrency)
-        l_audio.addStretch()
+        l_audio_top.addWidget(self.chk_mp3s)
+        l_audio_top.addWidget(self.lbl_audio_conc)
+        l_audio_top.addWidget(self.spin_audio_concurrency)
+        l_audio_top.addStretch()
+        l_audio.addLayout(l_audio_top)
+
+        self.txt_audio_v_range = QLineEdit()
+        self.txt_audio_v_range.setPlaceholderText("Custom Audio Range (e.g. V1-V19 + V31+, empty = all)")
+        self.txt_audio_v_range.setStyleSheet("font-size: 11px;")
+        l_audio.addWidget(self.txt_audio_v_range)
         grid_sel.addWidget(w_audio, 1, 1)
 
         # 6. Videos
@@ -688,7 +814,7 @@ class ChannelView(QWidget):
         self.btn_download_selected.setStyleSheet(
             "background-color: #34c759; color: #ffffff; font-weight: 800; font-size: 13px; padding: 8px 18px; border-radius: 6px;"
         )
-        self.btn_download_selected.setToolTip("Execute sequential download pipeline for all checked items on selected videos")
+        self.btn_download_selected.setToolTip("Execute download pipeline for all checked items on selected videos")
         self.btn_download_selected.clicked.connect(self._download_selected_items_clicked)
         bottom_sel_row.addWidget(self.btn_download_selected)
 
@@ -867,17 +993,19 @@ class ChannelView(QWidget):
 
         tbl_layout.addLayout(range_bar)
 
-        self.table = QTableWidget(0, 8)
-        headers = ["Sel", "Ver", "Title", "Duration", "Date", "Copy Title", "Script TXT", "Action"]
+        self.table = QTableWidget(0, 10)
+        headers = ["Sel", "Ver", "Title", "Views", "Duration", "Date", "Copy Title", "Script TXT", "Status", "Action"]
         self.table.setHorizontalHeaderLabels(headers)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.table.setColumnWidth(0, 45)
         self.table.setColumnWidth(1, 55)
-        self.table.setColumnWidth(3, 75)
-        self.table.setColumnWidth(4, 90)
-        self.table.setColumnWidth(5, 105)
-        self.table.setColumnWidth(6, 110)
-        self.table.setColumnWidth(7, 135)
+        self.table.setColumnWidth(3, 85)
+        self.table.setColumnWidth(4, 75)
+        self.table.setColumnWidth(5, 90)
+        self.table.setColumnWidth(6, 85)
+        self.table.setColumnWidth(7, 95)
+        self.table.setColumnWidth(8, 95)
+        self.table.setColumnWidth(9, 135)
         self.table.verticalHeader().setVisible(False)
         self.table.itemChanged.connect(self._on_table_item_changed)
         tbl_layout.addWidget(self.table)
@@ -1107,6 +1235,8 @@ class ChannelView(QWidget):
             return
 
         self.btn_fetch.setEnabled(False)
+        if hasattr(self, "btn_force_fetch"):
+            self.btn_force_fetch.setEnabled(False)
         self.btn_stop_fetch.setEnabled(True)
         count, auto_select_set = self._get_fetch_params()
         self._pending_auto_select_set = auto_select_set
@@ -1114,10 +1244,60 @@ class ChannelView(QWidget):
         count_label = f"{count} videos" if count else "All (Unlimited) videos"
         self.lbl_table_status.setText(f"Fetching {count_label} in {order} order...")
 
-        self.fetch_thread = MediaFetchThread(url, count, order)
+        self.fetch_thread = MediaFetchThread(url, count, order, force_refresh=False)
         self.fetch_thread.finished_signal.connect(self._on_fetch_finished)
         self.fetch_thread.error_signal.connect(self._on_fetch_error)
         self.fetch_thread.start()
+
+    def _force_fetch_videos_clicked(self):
+        url = self.txt_url.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Missing URL", "Please enter a YouTube channel, playlist, or video URL.")
+            return
+
+        self.btn_fetch.setEnabled(False)
+        if hasattr(self, "btn_force_fetch"):
+            self.btn_force_fetch.setEnabled(False)
+        self.btn_stop_fetch.setEnabled(True)
+        count, auto_select_set = self._get_fetch_params()
+        self._pending_auto_select_set = auto_select_set
+        order = self.combo_order.currentText()
+        count_label = f"{count} videos" if count else "All (Unlimited) videos"
+        self.lbl_table_status.setText(f"⚡ Force fetching {count_label} in {order} order (bypassing cache)...")
+
+        self.fetch_thread = MediaFetchThread(url, count, order, force_refresh=True)
+        self.fetch_thread.finished_signal.connect(self._on_fetch_finished)
+        self.fetch_thread.error_signal.connect(self._on_fetch_error)
+        self.fetch_thread.start()
+
+    def _on_url_text_changed(self, text: str):
+        raw = text.strip()
+        if len(raw) > 10 and any(k in raw for k in ("youtube.com", "youtu.be")):
+            if hasattr(self, "lbl_total_available_videos"):
+                self.lbl_total_available_videos.setText("Channel Videos: Detecting...")
+            self.auto_fetch_timer.start()
+        else:
+            if hasattr(self, "lbl_total_available_videos"):
+                self.lbl_total_available_videos.setText("Channel Videos: —")
+
+    def _on_auto_fetch_timeout(self):
+        url = self.txt_url.text().strip()
+        if not url:
+            return
+        self.summary_thread = SummaryFetchThread(url)
+        self.summary_thread.summary_ready.connect(self._on_summary_ready)
+        self.summary_thread.start()
+
+    def _on_summary_ready(self, summary: dict):
+        vid_count = summary.get("video_count")
+        c_name = summary.get("channel_name")
+        if hasattr(self, "lbl_total_available_videos"):
+            if vid_count:
+                self.lbl_total_available_videos.setText(f"Channel Videos: {vid_count:,}")
+            elif c_name:
+                self.lbl_total_available_videos.setText(f"Channel: {c_name[:20]}")
+            else:
+                self.lbl_total_available_videos.setText("Channel Videos: Available")
 
     def _stop_fetch_clicked(self):
         if self.fetch_thread and self.fetch_thread.isRunning():
@@ -1128,6 +1308,8 @@ class ChannelView(QWidget):
                 pass
             self.fetch_thread.quit()
         self.btn_fetch.setEnabled(True)
+        if hasattr(self, "btn_force_fetch"):
+            self.btn_force_fetch.setEnabled(True)
         self.btn_stop_fetch.setEnabled(False)
         self.lbl_table_status.setText("Fetch stopped immediately.")
 
@@ -1168,12 +1350,28 @@ class ChannelView(QWidget):
         self.lbl_range_status.setText("Selected: 0 / 0 videos")
         self.box_transcript_progress.setVisible(False)
         self.btn_view_diagnostics.setVisible(False)
+        if hasattr(self, "lbl_total_available_videos"):
+            self.lbl_total_available_videos.setText("Channel Videos: —")
 
     def _on_fetch_finished(self, candidates: List[ChannelCandidate]):
         self.btn_fetch.setEnabled(True)
+        if hasattr(self, "btn_force_fetch"):
+            self.btn_force_fetch.setEnabled(True)
         self.btn_stop_fetch.setEnabled(False)
         self.candidates = candidates
         order = self.combo_order.currentText()
+
+        # Dynamic smart default concurrency matching total fetched videos count
+        count = len(candidates)
+        if count > 0:
+            if hasattr(self, "spin_script_concurrency"):
+                self.spin_script_concurrency.setValue(min(500, max(1, count)))
+            if hasattr(self, "spin_audio_concurrency"):
+                self.spin_audio_concurrency.setValue(min(500, max(1, count)))
+            if hasattr(self, "spin_thumb_count"):
+                self.spin_thumb_count.setValue(min(9999, max(1, count)))
+            if hasattr(self, "lbl_total_available_videos"):
+                self.lbl_total_available_videos.setText(f"Channel Videos: {count} loaded")
 
         # Apply pending auto-selection if range/count was specified
         pending = getattr(self, "_pending_auto_select_set", None)
@@ -1192,6 +1390,8 @@ class ChannelView(QWidget):
 
     def _on_fetch_error(self, err_msg: str):
         self.btn_fetch.setEnabled(True)
+        if hasattr(self, "btn_force_fetch"):
+            self.btn_force_fetch.setEnabled(True)
         self.btn_stop_fetch.setEnabled(False)
         self.lbl_table_status.setText("Fetch failed.")
         QMessageBox.critical(self, "Fetch Error", f"Could not fetch videos: {err_msg}")
@@ -1222,17 +1422,23 @@ class ChannelView(QWidget):
             it_title = QTableWidgetItem(cand.title)
             self.table.setItem(row, 2, it_title)
 
-            # 3: Duration
+            # 3: Views
+            it_views = QTableWidgetItem(cand.view_count_str or "—")
+            it_views.setTextAlignment(Qt.AlignCenter)
+            it_views.setForeground(QColor("#8e8e93"))
+            self.table.setItem(row, 3, it_views)
+
+            # 4: Duration
             it_dur = QTableWidgetItem(cand.duration_str)
             it_dur.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 3, it_dur)
+            self.table.setItem(row, 4, it_dur)
 
-            # 4: Date
+            # 5: Date
             it_date = QTableWidgetItem(cand.upload_date)
             it_date.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 4, it_date)
+            self.table.setItem(row, 5, it_date)
 
-            # 5: Dedicated Copy Title button (Format: "V1. Title")
+            # 6: Dedicated Copy Title button (Format: "V1. Title")
             w_copy = QWidget()
             l_copy = QHBoxLayout(w_copy)
             l_copy.setContentsMargins(2, 2, 2, 2)
@@ -1241,9 +1447,9 @@ class ChannelView(QWidget):
             btn_copy_title.setStyleSheet("font-size: 11px; padding: 4px;")
             btn_copy_title.clicked.connect(lambda _, c=cand, b=btn_copy_title: self._copy_single_title(c, b))
             l_copy.addWidget(btn_copy_title)
-            self.table.setCellWidget(row, 5, w_copy)
+            self.table.setCellWidget(row, 6, w_copy)
 
-            # 6: Script / TXT Status & View
+            # 7: Script / TXT Status & View
             has_script = cand.video_id in self.transcripts_dict and bool(self.transcripts_dict[cand.video_id])
             w_script = QWidget()
             l_script = QHBoxLayout(w_script)
@@ -1252,9 +1458,25 @@ class ChannelView(QWidget):
             btn_script.setStyleSheet("font-size: 11px; padding: 4px;")
             btn_script.clicked.connect(lambda _, c=cand: self._on_single_script_clicked(c))
             l_script.addWidget(btn_script)
-            self.table.setCellWidget(row, 6, w_script)
+            self.table.setCellWidget(row, 7, w_script)
 
-            # 7: Dual Actions: ⬇ MP3 and ⬇ Video
+            # 8: Item Status
+            st = getattr(cand, "status_text", "Ready")
+            it_status = QTableWidgetItem(st)
+            it_status.setTextAlignment(Qt.AlignCenter)
+            if "Completed" in st or "Done" in st or "✓" in st:
+                it_status.setForeground(QColor("#34c759"))
+            elif "Retry" in st:
+                it_status.setForeground(QColor("#ff9500"))
+            elif "Fail" in st or "Error" in st:
+                it_status.setForeground(QColor("#ff3b30"))
+            elif "Download" in st or "Active" in st:
+                it_status.setForeground(QColor("#007aff"))
+            else:
+                it_status.setForeground(QColor("#8e8e93"))
+            self.table.setItem(row, 8, it_status)
+
+            # 9: Dual Actions: ⬇ MP3 and ⬇ Video
             w_act = QWidget()
             l_act = QHBoxLayout(w_act)
             l_act.setContentsMargins(2, 2, 2, 2)
@@ -1273,10 +1495,30 @@ class ChannelView(QWidget):
             btn_vid.clicked.connect(lambda _, c=cand: self._download_single_candidate(c, media_type="Video"))
             l_act.addWidget(btn_vid)
 
-            self.table.setCellWidget(row, 7, w_act)
+            self.table.setCellWidget(row, 9, w_act)
 
         self.table.blockSignals(False)
         self._is_populating_table = False
+
+    def _update_candidate_status(self, video_id: str, status: str):
+        """Updates live item status in table."""
+        for row, cand in enumerate(self.candidates):
+            if cand.video_id == video_id:
+                cand.status_text = status
+                it = self.table.item(row, 8)
+                if it:
+                    it.setText(status)
+                    if "Completed" in status or "Done" in status or "✓" in status:
+                        it.setForeground(QColor("#34c759"))
+                    elif "Retry" in status:
+                        it.setForeground(QColor("#ff9500"))
+                    elif "Fail" in status or "Error" in status:
+                        it.setForeground(QColor("#ff3b30"))
+                    elif "Download" in status:
+                        it.setForeground(QColor("#007aff"))
+                    else:
+                        it.setForeground(QColor("#8e8e93"))
+                break
 
     def _copy_single_title(self, cand: ChannelCandidate, btn: QPushButton):
         formatted_title = f"{cand.version_label}. {cand.title}"
@@ -1301,6 +1543,9 @@ class ChannelView(QWidget):
         QTimer.singleShot(1500, lambda: self.btn_copy_all_titles.setText("📋 1. Copy All Titles (V1. Title...)"))
 
     def _sync_selected_candidates(self) -> List[ChannelCandidate]:
+        if self.table.rowCount() == 0 and self.candidates:
+            return [c for c in self.candidates if getattr(c, "is_selected", True)]
+
         selected = []
         for row in range(self.table.rowCount()):
             chk = self.table.item(row, 0)
@@ -1403,12 +1648,12 @@ class ChannelView(QWidget):
 
     def _download_selected_items_clicked(self):
         """
-        Sequential Phased Download Pipeline (v3.4):
-        1. Titles (immediate real-time save to Titles.txt)
+        Sequential Phased & Parallel Download Pipeline (v3.5):
+        1. Titles (immediate real-time save to Titles.txt, selective/linked)
         2. Thumbnails (custom total limit, real-time live save)
         3. Channel Assets (competitor banner & logo, real-time live save)
-        4. Scripts / Transcripts (parallel worker pool with custom concurrency, real-time live save)
-        5. Audio Voiceover (parallel queue with custom concurrency, real-time live save)
+        4. Parallel Scripts & Audio (concurrent streams, unlimited concurrency up to 500, real-time live save)
+        Finalize: Full statistics modal with auto-retry
         """
         selected = self._sync_selected_candidates()
         if not selected:
@@ -1451,13 +1696,74 @@ class ChannelView(QWidget):
             )
             return
 
+        # V3.5 Selective Download & Skip Manager
+        skip_spec = self.txt_skip_ranges.text().strip() if hasattr(self, "txt_skip_ranges") else ""
+        script_v_spec = self.txt_script_v_range.text().strip() if hasattr(self, "txt_script_v_range") else ""
+        audio_v_spec = self.txt_audio_v_range.text().strip() if hasattr(self, "txt_audio_v_range") else ""
+        want_linked_titles = self.chk_titles_linked.isChecked() if hasattr(self, "chk_titles_linked") else False
+
+        if skip_spec:
+            active_selected = VRangeParser.filter_candidates(selected, exclude_spec=skip_spec)
+            for cand in selected:
+                if cand not in active_selected:
+                    self._update_candidate_status(cand.video_id, "Skipped")
+        else:
+            active_selected = list(selected)
+
+        if not active_selected:
+            QMessageBox.warning(
+                self,
+                "All Videos Skipped",
+                "All selected videos were excluded by the Skip V-Ranges filter.",
+            )
+            return
+
+        # Filter candidate lists per asset type
+        script_candidates = (
+            VRangeParser.filter_candidates(active_selected, include_spec=script_v_spec)
+            if (want_scripts and script_v_spec)
+            else (list(active_selected) if want_scripts else [])
+        )
+
+        audio_candidates = (
+            VRangeParser.filter_candidates(active_selected, include_spec=audio_v_spec)
+            if ((want_mp3s or want_videos) and audio_v_spec)
+            else (list(active_selected) if (want_mp3s or want_videos) else [])
+        )
+
+        thumb_count = self.spin_thumb_count.value() if hasattr(self, "spin_thumb_count") else len(active_selected)
+        thumb_max = min(thumb_count, len(active_selected))
+        thumb_candidates = active_selected[:thumb_max] if want_thumbnails else []
+
+        if want_titles:
+            if want_linked_titles:
+                linked_ids = {c.video_id for c in script_candidates} | {c.video_id for c in audio_candidates}
+                title_candidates = [c for c in active_selected if c.video_id in linked_ids]
+            else:
+                title_candidates = list(active_selected)
+        else:
+            title_candidates = []
+
+        if not any([
+            title_candidates,
+            thumb_candidates,
+            want_channel_assets,
+            script_candidates,
+            audio_candidates,
+        ]):
+            QMessageBox.warning(
+                self,
+                "No Matching Items",
+                "No items match the selected V-ranges.",
+            )
+            return
+
         base_dir = Path(self.txt_out_dir.text().strip())
         base_dir.mkdir(parents=True, exist_ok=True)
 
         channel_name = self.fetcher.channel_name or (selected[0].uploader if selected else "")
         channel_url = self.fetcher.channel_url or (selected[0].channel_url if selected else self.txt_url.text().strip())
 
-        thumb_count = self.spin_thumb_count.value() if hasattr(self, "spin_thumb_count") else len(selected)
         script_concurrency = self.spin_script_concurrency.value() if hasattr(self, "spin_script_concurrency") else 3
         audio_concurrency = self.spin_audio_concurrency.value() if hasattr(self, "spin_audio_concurrency") else 3
 
@@ -1472,29 +1778,38 @@ class ChannelView(QWidget):
         self.btn_resume_prog.setVisible(False)
         self.box_transcript_progress.setVisible(True)
         self.bar_transcripts.setValue(0)
-        self.lbl_transcript_status.setText("🚀 Starting Sequential Phased Downloads...")
-        self.lbl_progress_details.setText(f"Preparing ordered download for {len(selected)} videos...")
+        self.lbl_transcript_status.setText("🚀 Starting Phased & Parallel Downloads...")
+        self.lbl_progress_details.setText(f"Preparing download for {len(active_selected)} videos...")
+
+        # Set table status to Queued for active videos
+        for cand in active_selected:
+            self._update_candidate_status(cand.video_id, "Queued")
 
         self._phased_pipeline_state = {
             "base_dir": base_dir,
-            "selected": selected,
+            "selected": active_selected,
+            "all_selected": selected,
             "channel_name": channel_name,
             "channel_url": channel_url,
-            "want_titles": want_titles,
-            "want_thumbnails": want_thumbnails,
+            "want_titles": bool(want_titles and title_candidates),
+            "want_thumbnails": bool(want_thumbnails and thumb_candidates),
             "want_channel_assets": want_channel_assets,
-            "want_scripts": want_scripts,
-            "want_mp3s": want_mp3s,
-            "want_videos": want_videos,
+            "want_scripts": bool(want_scripts and script_candidates),
+            "want_mp3s": bool(want_mp3s and audio_candidates),
+            "want_videos": bool(want_videos and audio_candidates),
+            "title_candidates": title_candidates,
+            "thumb_candidates": thumb_candidates,
+            "script_candidates": script_candidates,
+            "audio_candidates": audio_candidates,
             "thumb_count": thumb_count,
             "script_concurrency": script_concurrency,
             "audio_concurrency": audio_concurrency,
             # Phase done flags
-            "titles_done": not want_titles,
-            "thumbs_done": not want_thumbnails,
+            "titles_done": not bool(want_titles and title_candidates),
+            "thumbs_done": not bool(want_thumbnails and thumb_candidates),
             "assets_done": not want_channel_assets,
-            "scripts_done": not want_scripts,
-            "media_done": not (want_mp3s or want_videos),
+            "scripts_done": not bool(want_scripts and script_candidates),
+            "media_done": not bool((want_mp3s or want_videos) and audio_candidates),
             # Counts
             "titles_saved": 0,
             "thumbs_saved": 0,
@@ -1512,11 +1827,11 @@ class ChannelView(QWidget):
         self._parallel_state = self._phased_pipeline_state
 
         # Update category labels
-        self.lbl_prog_titles.setText("📝 <b>1. Titles:</b> " + ("Waiting..." if want_titles else "Not Selected"))
-        self.lbl_prog_thumbs.setText("🖼️ <b>2. Thumbnails:</b> " + ("Waiting..." if want_thumbnails else "Not Selected"))
+        self.lbl_prog_titles.setText("📝 <b>1. Titles:</b> " + (f"Waiting... ({len(title_candidates)} titles)" if title_candidates else "Not Selected"))
+        self.lbl_prog_thumbs.setText("🖼️ <b>2. Thumbnails:</b> " + (f"Waiting... ({len(thumb_candidates)} thumbs)" if thumb_candidates else "Not Selected"))
         self.lbl_prog_assets.setText("🎨 <b>3. Channel Assets:</b> " + ("Waiting..." if want_channel_assets else "Not Selected"))
-        self.lbl_prog_scripts.setText("📜 <b>4. Scripts:</b> " + ("Waiting..." if want_scripts else "Not Selected"))
-        self.lbl_prog_media.setText("🎵 <b>5. Audio/Media:</b> " + ("Waiting..." if (want_mp3s or want_videos) else "Not Selected"))
+        self.lbl_prog_scripts.setText("📜 <b>4. Scripts:</b> " + (f"Waiting... ({len(script_candidates)} scripts, ⚡ {script_concurrency} streams)" if script_candidates else "Not Selected"))
+        self.lbl_prog_media.setText("🎵 <b>5. Audio/Media:</b> " + (f"Waiting... ({len(audio_candidates)} items, ⚡ {audio_concurrency} streams)" if audio_candidates else "Not Selected"))
 
         # Launch Phase 1: Titles
         self._run_phase_1_titles()
@@ -1531,27 +1846,38 @@ class ChannelView(QWidget):
         if state.get("cancelled"):
             return
 
-        if state["want_titles"]:
-            self.lbl_transcript_status.setText("Phase 1/5: Exporting Video Titles...")
-            self.lbl_prog_titles.setText("📝 <b>1. Titles:</b> Writing Titles.txt...")
+        if state["want_titles"] and state["title_candidates"]:
+            tot_t = len(state["title_candidates"])
+            self.lbl_transcript_status.setText(f"Phase 1: Exporting {tot_t} Video Titles...")
+            self.lbl_prog_titles.setText(f"📝 <b>1. Titles:</b> Writing Titles.txt ({tot_t} titles)...")
             titles_file = state["base_dir"] / "Titles.txt"
-            try:
-                ZipPackager.export_single_titles_file(
-                    candidates=state["selected"],
-                    output_file=titles_file,
-                    channel_name=state["channel_name"],
-                    channel_url=state["channel_url"],
-                )
-                state["titles_saved"] = len(state["selected"])
-                self.lbl_prog_titles.setText(f"📝 <b>1. Titles:</b> ✓ Saved ({len(state['selected'])} titles)")
-            except Exception as e:
-                logger.error(f"Failed to export Titles.txt: {e}")
-                self.lbl_prog_titles.setText(f"📝 <b>1. Titles:</b> ⚠️ Error: {e}")
+            success = False
+            last_err = ""
+            for attempt in range(1, 6):
+                try:
+                    ZipPackager.export_single_titles_file(
+                        candidates=state["title_candidates"],
+                        output_file=titles_file,
+                        channel_name=state["channel_name"],
+                        channel_url=state["channel_url"],
+                    )
+                    success = True
+                    break
+                except Exception as e:
+                    last_err = str(e)
+                    time.sleep(0.3)
+
+            if success:
+                state["titles_saved"] = tot_t
+                self.lbl_prog_titles.setText(f"📝 <b>1. Titles:</b> ✓ Saved ({tot_t} titles)")
+            else:
+                logger.error(f"Failed to export Titles.txt after 5 retries: {last_err}")
+                self.lbl_prog_titles.setText(f"📝 <b>1. Titles:</b> ⚠️ Error after 5 retries: {last_err}")
                 state["failed_items"].append({
                     "version_label": "All",
                     "title": "Titles.txt",
                     "category": "Title",
-                    "reason": str(e),
+                    "reason": last_err,
                 })
         else:
             self.lbl_prog_titles.setText("📝 <b>1. Titles:</b> Not Selected")
@@ -1568,16 +1894,18 @@ class ChannelView(QWidget):
         if state.get("cancelled"):
             return
 
-        if state["want_thumbnails"]:
+        if state["want_thumbnails"] and state["thumb_candidates"]:
             thumb_dir = state["base_dir"] / "Thumbnails"
             thumb_dir.mkdir(parents=True, exist_ok=True)
-            total_cand = len(state["selected"])
-            max_c = min(state["thumb_count"], total_cand)
-            self.lbl_transcript_status.setText(f"Phase 2/5: Downloading Thumbnails (1 to {max_c} of {total_cand})...")
+            max_c = len(state["thumb_candidates"])
+            self.lbl_transcript_status.setText(f"Phase 2: Downloading Thumbnails (1 to {max_c})...")
             self.lbl_prog_thumbs.setText(f"🖼️ <b>2. Thumbnails:</b> Starting (0/{max_c})...")
 
+            for cand in state["thumb_candidates"]:
+                self._update_candidate_status(cand.video_id, "Downloading Thumbnail")
+
             self.thumbnail_thread = BatchThumbnailThread(
-                candidates=state["selected"],
+                candidates=state["thumb_candidates"],
                 output_dir=thumb_dir,
                 max_count=max_c,
             )
@@ -1622,7 +1950,7 @@ class ChannelView(QWidget):
         if state["want_channel_assets"] and channel_url:
             assets_dir = state["base_dir"] / "Channel Assets"
             assets_dir.mkdir(parents=True, exist_ok=True)
-            self.lbl_transcript_status.setText("Phase 3/5: Downloading Channel Assets (Banner & Logo)...")
+            self.lbl_transcript_status.setText("Phase 3: Downloading Channel Assets (Banner & Logo)...")
             self.lbl_prog_assets.setText("🎨 <b>3. Channel Assets:</b> Downloading...")
 
             self.channel_assets_thread = ChannelAssetsThread(
@@ -1639,7 +1967,7 @@ class ChannelView(QWidget):
             reason = "Skipped (No URL)" if state["want_channel_assets"] else "Not Selected"
             self.lbl_prog_assets.setText(f"🎨 <b>3. Channel Assets:</b> {reason}")
             self._update_phased_overall_progress()
-            self._run_phase_4_scripts()
+            self._run_phase_4_and_5_parallel()
 
     def _on_phased_assets_finished(self, res: dict):
         state = getattr(self, "_phased_pipeline_state", None) or getattr(self, "_parallel_state", None)
@@ -1649,7 +1977,7 @@ class ChannelView(QWidget):
         state["assets_saved"] = len(res) if res else 0
         self.lbl_prog_assets.setText(f"🎨 <b>3. Channel Assets:</b> ✓ Saved ({len(res)} assets)")
         self._update_phased_overall_progress()
-        self._run_phase_4_scripts()
+        self._run_phase_4_and_5_parallel()
 
     def _on_phased_assets_error(self, err_msg: str):
         state = getattr(self, "_phased_pipeline_state", None) or getattr(self, "_parallel_state", None)
@@ -1658,24 +1986,34 @@ class ChannelView(QWidget):
         state["assets_done"] = True
         self.lbl_prog_assets.setText(f"🎨 <b>3. Channel Assets:</b> ⚠️ {err_msg}")
         self._update_phased_overall_progress()
-        self._run_phase_4_scripts()
+        self._run_phase_4_and_5_parallel()
 
-    # ---------- PHASE 4: SCRIPTS (PARALLEL) ----------
-    def _run_phase_4_scripts(self):
+    # ---------- PHASES 4 & 5: CONCURRENT PARALLEL SCRIPTS & AUDIO ----------
+    def _run_phase_4_and_5_parallel(self):
+        """
+        Executes Scripts and Audio concurrently in parallel (v3.5).
+        Both pipelines run simultaneously with their independent concurrency streams.
+        """
         state = self._phased_pipeline_state
         if state.get("cancelled"):
             return
 
-        if state["want_scripts"]:
+        scripts_started = False
+        media_started = False
+
+        # 1. Launch Scripts in parallel
+        if state["want_scripts"] and state["script_candidates"]:
             scripts_dir = state["base_dir"] / "Scripts"
             scripts_dir.mkdir(parents=True, exist_ok=True)
             conc = state["script_concurrency"]
-            total_cand = len(state["selected"])
-            self.lbl_transcript_status.setText(f"Phase 4/5: Downloading Scripts in Parallel (⚡ {conc} Concurrent Streams)...")
-            self.lbl_prog_scripts.setText(f"📜 <b>4. Scripts:</b> Starting (0/{total_cand})...")
+            total_cand = len(state["script_candidates"])
+            self.lbl_prog_scripts.setText(f"📜 <b>4. Scripts:</b> Starting 0/{total_cand} (⚡ {conc} Concurrent Streams)...")
+
+            for cand in state["script_candidates"]:
+                self._update_candidate_status(cand.video_id, "Downloading Script")
 
             self.transcripts_thread = BatchTranscriptThread(
-                candidates=state["selected"],
+                candidates=state["script_candidates"],
                 existing_transcripts=self.transcripts_dict,
                 output_dir=scripts_dir,
                 concurrency=conc,
@@ -1685,11 +2023,106 @@ class ChannelView(QWidget):
             self.transcripts_thread.item_diagnostics.connect(self._on_script_diag)
             self.transcripts_thread.all_finished.connect(self._on_phased_script_done)
             self.transcripts_thread.start()
+            scripts_started = True
         else:
             state["scripts_done"] = True
             self.lbl_prog_scripts.setText("📜 <b>4. Scripts:</b> Not Selected")
+
+        # 2. Launch Audio & Video Media in parallel
+        media_items = []
+        if state["want_mp3s"] and state["audio_candidates"]:
+            audio_dir = state["base_dir"] / "Audio"
+            audio_dir.mkdir(parents=True, exist_ok=True)
+            for cand in state["audio_candidates"]:
+                item = DownloadItem(
+                    url=cand.url,
+                    media_type="Audio",
+                    quality=self.combo_quality.currentText(),
+                    format_ext=self.combo_format.currentText(),
+                    custom_output_dir=str(audio_dir),
+                    version_label=cand.version_label,
+                    title=cand.title,
+                    channel=cand.uploader,
+                    duration_sec=cand.duration,
+                    video_id=cand.video_id,
+                )
+                media_items.append(item)
+                state["media_items_map"][item.id] = item
+
+        if state["want_videos"] and state["audio_candidates"]:
+            v_dir = state["base_dir"] / "Videos"
+            v_dir.mkdir(parents=True, exist_ok=True)
+            for cand in state["audio_candidates"]:
+                item = DownloadItem(
+                    url=cand.url,
+                    media_type="Video",
+                    quality=self.combo_video_quality.currentText(),
+                    format_ext=self.combo_video_format.currentText(),
+                    custom_output_dir=str(v_dir),
+                    version_label=cand.version_label,
+                    title=cand.title,
+                    channel=cand.uploader,
+                    duration_sec=cand.duration,
+                    video_id=cand.video_id,
+                )
+                media_items.append(item)
+                state["media_items_map"][item.id] = item
+
+        if media_items:
+            conc = state["audio_concurrency"]
+            self.lbl_prog_media.setText(f"🎵 <b>5. Audio/Media:</b> Queued {len(media_items)} tasks (⚡ {conc} Simultaneous)...")
+
+            for cand in state["audio_candidates"]:
+                cur = getattr(cand, "status_text", "")
+                if not cur or cur == "Queued":
+                    self._update_candidate_status(cand.video_id, "Downloading Audio")
+
+            try:
+                self.queue_manager.item_completed.disconnect(self._on_phased_media_completed)
+            except Exception:
+                pass
+            try:
+                self.queue_manager.item_failed.disconnect(self._on_phased_media_failed)
+            except Exception:
+                pass
+            try:
+                self.queue_manager.all_finished.disconnect(self._on_phased_media_all_finished)
+            except Exception:
+                pass
+
+            self.queue_manager.item_completed.connect(self._on_phased_media_completed)
+            self.queue_manager.item_failed.connect(self._on_phased_media_failed)
+            self.queue_manager.all_finished.connect(self._on_phased_media_all_finished)
+
+            self.queue_manager.add_items(media_items)
+            self.queue_manager.start()
+            media_started = True
+        else:
+            state["media_done"] = True
+            self.lbl_prog_media.setText("🎵 <b>5. Audio/Media:</b> Not Selected")
+
+        if scripts_started and media_started:
+            self.lbl_transcript_status.setText(
+                f"Phase 4 & 5: Parallel Streaming (Scripts ⚡ {state['script_concurrency']} & Audio ⚡ {state['audio_concurrency']})..."
+            )
+        elif scripts_started:
+            self.lbl_transcript_status.setText(f"Phase 4/5: Downloading Scripts (⚡ {state['script_concurrency']} Concurrent Streams)...")
+        elif media_started:
+            self.lbl_transcript_status.setText(f"Phase 5/5: Downloading Audio (⚡ {state['audio_concurrency']} Concurrent Streams)...")
+        else:
             self._update_phased_overall_progress()
-            self._run_phase_5_media()
+            self._finalize_phased_pipeline()
+            return
+
+        self._update_phased_overall_progress()
+
+    def _run_phase_4_scripts(self):
+        """Backward compatibility alias."""
+        self._run_phase_4_and_5_parallel()
+
+    def _run_phase_5_media(self):
+        """Backward compatibility alias."""
+        self._run_phase_4_and_5_parallel()
 
     def _on_script_item(self, vid_id: str, text: str):
         self.transcripts_dict[vid_id] = text
@@ -1715,7 +2148,7 @@ class ChannelView(QWidget):
         try:
             scripts_dir = state["base_dir"] / "Scripts"
             saved_s = TranscriptFetcher.export_transcripts_to_folder(
-                candidates=state["selected"],
+                candidates=state.get("script_candidates", state.get("selected", [])),
                 transcripts_dict=self.transcripts_dict,
                 output_dir=scripts_dir,
             )
@@ -1724,85 +2157,19 @@ class ChannelView(QWidget):
         except Exception as e:
             logger.debug(f"Error finalizing transcripts: {e}")
 
+        # Update candidate status in table
+        for cand in state.get("script_candidates", []):
+            if cand.video_id in self.transcripts_dict and self.transcripts_dict[cand.video_id]:
+                if not (state.get("want_mp3s") or state.get("want_videos")):
+                    self._update_candidate_status(cand.video_id, "Completed")
+            else:
+                self._update_candidate_status(cand.video_id, "Script Missing")
+
         self.lbl_prog_scripts.setText(f"📜 <b>4. Scripts:</b> ✓ Complete ({state['scripts_saved']} saved)")
         self._update_phased_overall_progress()
 
-        # Chain to Phase 5: Media
-        self._run_phase_5_media()
-
-    # ---------- PHASE 5: AUDIO & VIDEOS (PARALLEL) ----------
-    def _run_phase_5_media(self):
-        state = self._phased_pipeline_state
-        if state.get("cancelled"):
-            return
-
-        media_items = []
-        if state["want_mp3s"]:
-            audio_dir = state["base_dir"] / "Audio"
-            audio_dir.mkdir(parents=True, exist_ok=True)
-            for cand in state["selected"]:
-                item = DownloadItem(
-                    url=cand.url,
-                    media_type="Audio",
-                    quality=self.combo_quality.currentText(),
-                    format_ext=self.combo_format.currentText(),
-                    custom_output_dir=str(audio_dir),
-                    version_label=cand.version_label,
-                    title=cand.title,
-                    channel=cand.uploader,
-                    duration_sec=cand.duration,
-                    video_id=cand.video_id,
-                )
-                media_items.append(item)
-                state["media_items_map"][item.id] = item
-
-        if state["want_videos"]:
-            v_dir = state["base_dir"] / "Videos"
-            v_dir.mkdir(parents=True, exist_ok=True)
-            for cand in state["selected"]:
-                item = DownloadItem(
-                    url=cand.url,
-                    media_type="Video",
-                    quality=self.combo_video_quality.currentText(),
-                    format_ext=self.combo_video_format.currentText(),
-                    custom_output_dir=str(v_dir),
-                    version_label=cand.version_label,
-                    title=cand.title,
-                    channel=cand.uploader,
-                    duration_sec=cand.duration,
-                    video_id=cand.video_id,
-                )
-                media_items.append(item)
-                state["media_items_map"][item.id] = item
-
-        if media_items:
-            conc = state["audio_concurrency"]
-            self.lbl_transcript_status.setText(f"Phase 5/5: Downloading Media in Parallel (⚡ {conc} Concurrent Streams)...")
-            self.lbl_prog_media.setText(f"🎵 <b>5. Audio/Media:</b> Queued {len(media_items)} tasks (⚡ {conc} Simultaneous)...")
-
-            try:
-                self.queue_manager.item_completed.disconnect(self._on_phased_media_completed)
-            except Exception:
-                pass
-            try:
-                self.queue_manager.item_failed.disconnect(self._on_phased_media_failed)
-            except Exception:
-                pass
-            try:
-                self.queue_manager.all_finished.disconnect(self._on_phased_media_all_finished)
-            except Exception:
-                pass
-
-            self.queue_manager.item_completed.connect(self._on_phased_media_completed)
-            self.queue_manager.item_failed.connect(self._on_phased_media_failed)
-            self.queue_manager.all_finished.connect(self._on_phased_media_all_finished)
-
-            self.queue_manager.add_items(media_items)
-            self.queue_manager.start()
-        else:
-            state["media_done"] = True
-            self.lbl_prog_media.setText("🎵 <b>5. Audio/Media:</b> Not Selected")
-            self._update_phased_overall_progress()
+        # If audio media is also completed, finalize the pipeline!
+        if state.get("media_done"):
             self._finalize_phased_pipeline()
 
     def _on_phased_media_completed(self, item):
@@ -1810,12 +2177,14 @@ class ChannelView(QWidget):
         if not state or item.id not in state["media_items_map"]:
             return
         state["media_completed_count"] += 1
+        if item.video_id:
+            self._update_candidate_status(item.video_id, "Completed")
         total_media = len(state["media_items_map"])
         if total_media > 0 and (state["media_completed_count"] + state["media_failed_count"] >= total_media):
             state["media_done"] = True
         self._update_phased_media_status()
         self._update_phased_overall_progress()
-        if state["media_done"]:
+        if state["media_done"] and state.get("scripts_done"):
             self._finalize_phased_pipeline()
 
     def _on_phased_media_failed(self, item, err_msg):
@@ -1823,6 +2192,8 @@ class ChannelView(QWidget):
         if not state or item.id not in state["media_items_map"]:
             return
         state["media_failed_count"] += 1
+        if item.video_id:
+            self._update_candidate_status(item.video_id, f"Failed: {err_msg[:25]}")
         state["failed_items"].append({
             "version_label": item.version_label or "V?",
             "title": item.title or "Unknown",
@@ -1836,7 +2207,7 @@ class ChannelView(QWidget):
             state["media_done"] = True
         self._update_phased_media_status()
         self._update_phased_overall_progress()
-        if state["media_done"]:
+        if state["media_done"] and state.get("scripts_done"):
             self._finalize_phased_pipeline()
 
     def _on_phased_media_all_finished(self):
@@ -1846,7 +2217,8 @@ class ChannelView(QWidget):
         state["media_done"] = True
         self._update_phased_media_status()
         self._update_phased_overall_progress()
-        self._finalize_phased_pipeline()
+        if state.get("scripts_done"):
+            self._finalize_phased_pipeline()
 
     def _update_phased_media_status(self):
         state = getattr(self, "_phased_pipeline_state", None) or getattr(self, "_parallel_state", None)
@@ -1870,7 +2242,6 @@ class ChannelView(QWidget):
 
         total_weight = 0
         completed_weight = 0
-        num_vids = len(state.get("selected", []))
 
         if state.get("want_titles"):
             total_weight += 5
@@ -1879,8 +2250,8 @@ class ChannelView(QWidget):
 
         if state.get("want_thumbnails"):
             total_weight += 25
-            target_t = min(state.get("thumb_count", num_vids), max(1, num_vids))
-            thumbs_progress = (state.get("thumbs_saved", 0) + state.get("thumbs_skipped", 0)) / max(1, target_t)
+            target_t = max(1, len(state.get("thumb_candidates", [])))
+            thumbs_progress = (state.get("thumbs_saved", 0) + state.get("thumbs_skipped", 0)) / target_t
             completed_weight += int(25 * min(1.0, thumbs_progress))
 
         if state.get("want_channel_assets"):
@@ -1890,7 +2261,8 @@ class ChannelView(QWidget):
 
         if state.get("want_scripts"):
             total_weight += 35
-            scripts_progress = (state.get("scripts_saved", 0) + state.get("scripts_skipped", 0)) / max(1, num_vids)
+            target_s = max(1, len(state.get("script_candidates", [])))
+            scripts_progress = (state.get("scripts_saved", 0) + state.get("scripts_skipped", 0)) / target_s
             completed_weight += int(35 * min(1.0, scripts_progress))
 
         if state.get("want_mp3s") or state.get("want_videos"):
@@ -1901,7 +2273,7 @@ class ChannelView(QWidget):
 
         pct = int((completed_weight / max(1, total_weight)) * 100) if total_weight > 0 else 100
         self.bar_transcripts.setValue(min(100, pct))
-        self.lbl_progress_details.setText(f"Overall Progress: {pct}% complete across sequential pipeline")
+        self.lbl_progress_details.setText(f"Overall Progress: {pct}% complete across pipeline")
 
     def _finalize_phased_pipeline(self):
         state = getattr(self, "_phased_pipeline_state", None) or getattr(self, "_parallel_state", None)
@@ -1914,7 +2286,7 @@ class ChannelView(QWidget):
 
         # Collect missing scripts as failed items with diagnostics
         if state.get("want_scripts"):
-            for cand in selected:
+            for cand in state.get("script_candidates", selected):
                 vid_id = cand.video_id
                 has_script = vid_id in self.transcripts_dict and bool(self.transcripts_dict[vid_id])
                 if not has_script:
@@ -1929,11 +2301,10 @@ class ChannelView(QWidget):
                         "candidate": cand,
                     })
 
-        # Collect missing thumbnails as failed items (respecting thumb_count)
+        # Collect missing thumbnails as failed items
         if state.get("want_thumbnails"):
             thumb_dir = base_dir / "Thumbnails"
-            max_c = min(state.get("thumb_count", len(selected)), len(selected))
-            for cand in selected[:max_c]:
+            for cand in state.get("thumb_candidates", selected):
                 v_lbl = cand.version_label or f"V{cand.version_num}"
                 expected_thumb = thumb_dir / f"{v_lbl} Thumbnail.jpg"
                 if not expected_thumb.exists() or expected_thumb.stat().st_size <= 1024:
@@ -1960,7 +2331,7 @@ class ChannelView(QWidget):
             "total_skipped": total_skip,
             "titles_status": f"1 master file at {base_dir / 'Titles.txt'}" if state.get("want_titles") else "Not Selected",
             "thumbnails_status": (
-                f"{state.get('thumbs_saved', 0)} saved (target: {state.get('thumb_count', 0)}), {state.get('thumbs_skipped', 0)} skipped"
+                f"{state.get('thumbs_saved', 0)} saved (target: {len(state.get('thumb_candidates', []))}), {state.get('thumbs_skipped', 0)} skipped"
                 if state.get("want_thumbnails") else "Not Selected"
             ),
             "assets_status": (
@@ -1985,7 +2356,7 @@ class ChannelView(QWidget):
         self._last_failed_items = state["failed_items"]
 
         self.bar_transcripts.setValue(100)
-        self.lbl_transcript_status.setText("✅ All Sequential Downloads Finished Successfully!")
+        self.lbl_transcript_status.setText("✅ Phased & Parallel Downloads Finished Successfully!")
         self.lbl_progress_details.setText(f"Completed processing {len(selected)} videos live in real-time. View statistics below.")
         self.btn_view_diagnostics.setVisible(True)
 

@@ -27,6 +27,7 @@ hiddenimports = [
     'app.downloader.metadata_purifier',
     'app.downloader.channel_assets_fetcher',
     'app.utils.range_parser',
+    'app.utils.v_range_parser',
     'app.utils.title_matcher',
     'app.utils.filename',
     'app.utils.logger',

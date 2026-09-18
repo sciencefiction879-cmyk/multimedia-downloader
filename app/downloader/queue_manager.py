@@ -257,7 +257,16 @@ class QueueManager(QObject):
         if item.id in self.active_workers:
             del self.active_workers[item.id]
 
-        self.item_failed.emit(item, error_msg)
+        max_retries = getattr(self.settings, "max_retries", 5) or 5
+        if item.retries < max_retries and not item.is_cancelled:
+            item.retries += 1
+            item.status = DownloadStatus.QUEUED
+            item.error_message = f"Retrying ({item.retries}/{max_retries})... {error_msg}"
+            logger.info(f"Auto-retrying {item.id} (attempt {item.retries}/{max_retries}): {error_msg}")
+            self.item_updated.emit(item)
+        else:
+            self.item_failed.emit(item, error_msg)
+
         self.save_queue()
         self._process_queue()
 

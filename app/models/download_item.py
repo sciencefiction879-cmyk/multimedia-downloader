@@ -60,7 +60,7 @@ class DownloadItem:
     error_message: str = ""
     backend_output: str = ""
     retry_count: int = 0
-    max_retries: int = 3
+    max_retries: int = 5
     is_cancelled: bool = False
     is_paused: bool = False
 
@@ -68,6 +68,14 @@ class DownloadItem:
     transcript_filepath: Optional[str] = None
     completed_at: Optional[datetime] = None
     extra_metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def retries(self) -> int:
+        return self.retry_count
+
+    @retries.setter
+    def retries(self, val: int):
+        self.retry_count = val
 
     def __post_init__(self):
         self.recalculate_estimated_size()

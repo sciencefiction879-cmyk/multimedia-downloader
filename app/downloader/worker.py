@@ -197,6 +197,11 @@ class DownloadWorker(QThread):
                         final_path.unlink()
                     shutil.move(str(temp_file), str(final_path))
 
+            # Verification: ensure file exists and is valid/non-empty
+            min_expected_size = 10240 if is_audio else 50000
+            if not final_path.exists() or final_path.stat().st_size < min_expected_size:
+                raise DownloadError(f"File verification failed: {final_path.name} is missing or incomplete (< {min_expected_size} bytes)")
+
             self.item.output_filepath = str(final_path)
             self.item.status = DownloadStatus.COMPLETED
             self.item.progress_percent = 100.0

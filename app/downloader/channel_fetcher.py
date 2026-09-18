@@ -6,7 +6,12 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import yt_dlp
-from app.config import ORDER_LATEST_TO_OLDEST, ORDER_OLDEST_TO_LATEST
+from app.config import (
+    ORDER_LATEST_TO_OLDEST,
+    ORDER_OLDEST_TO_LATEST,
+    ORDER_POPULAR_TO_LEAST,
+    ORDER_LEAST_TO_POPULAR,
+)
 from app.core.exceptions import MetadataError
 from app.utils.logger import logger
 
@@ -28,6 +33,8 @@ class ChannelCandidate:
     original_index: int = 0
     custom_title: Optional[str] = None
     match_score: float = 100.0
+    view_count: int = 0
+    view_count_str: str = ""
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], index: int = 1, parent_channel: str = "", parent_channel_url: str = "") -> "ChannelCandidate":
@@ -53,6 +60,17 @@ class ChannelCandidate:
         uploader = data.get("uploader") or data.get("channel") or parent_channel or ""
         c_url = data.get("channel_url") or data.get("uploader_url") or parent_channel_url or ""
 
+        raw_views = data.get("view_count")
+        view_cnt = 0
+        view_cnt_str = ""
+        if raw_views is not None:
+            try:
+                view_cnt = int(raw_views)
+                view_cnt_str = f"{view_cnt:,}"
+            except (ValueError, TypeError):
+                view_cnt = 0
+                view_cnt_str = ""
+
         return cls(
             video_id=vid_id,
             url=url,
@@ -66,11 +84,30 @@ class ChannelCandidate:
             version_label=f"V{index}",
             version_num=index,
             original_index=index,
+            view_count=view_cnt,
+            view_count_str=view_cnt_str,
         )
 
 
 import json
 import urllib.request
+
+
+def _parse_views_to_int(view_text: str) -> int:
+    """Parses strings like '1.2M views', '45K views', '1,234 views', '12M' into integer."""
+    if not view_text:
+        return 0
+    clean = str(view_text).lower().replace("views", "").replace("view", "").replace(",", "").strip()
+    try:
+        if clean.endswith("k"):
+            return int(float(clean[:-1].strip()) * 1_000)
+        if clean.endswith("m"):
+            return int(float(clean[:-1].strip()) * 1_000_000)
+        if clean.endswith("b"):
+            return int(float(clean[:-1].strip()) * 1_000_000_000)
+        return int(float(clean))
+    except Exception:
+        return 0
 
 
 def _parse_duration_to_sec(dur_str: str) -> float:
@@ -110,8 +147,9 @@ class ChannelFetcher:
         url: str,
         max_results: Optional[int] = 50,
         order: str = ORDER_LATEST_TO_OLDEST,
+        force_refresh: bool = False,
     ) -> List[ChannelCandidate]:
-        logger.info(f"Fetching channel/playlist videos from: {url} (max: {max_results}, order: {order})")
+        logger.info(f"Fetching channel/playlist videos from: {url} (max: {max_results}, order: {order}, force: {force_refresh})")
 
         # Reset channel info
         self.channel_name = ""
@@ -126,13 +164,14 @@ class ChannelFetcher:
             target_url = target_url.rstrip("/") + "/videos"
 
         # -----------------------------------------------------------------
-        # 1. If ORDER_OLDEST_TO_LATEST requested on a channel:
-        #    Use YouTube Innertube "Oldest" chip so V1 is genuinely the oldest video!
+        # 1. Innertube direct chips:
+        #    - ORDER_OLDEST_TO_LATEST -> "Oldest" chip
+        #    - ORDER_POPULAR_TO_LEAST -> "Popular" chip
         # -----------------------------------------------------------------
-        if order == ORDER_OLDEST_TO_LATEST and is_channel_url:
+        if is_channel_url and order in (ORDER_OLDEST_TO_LATEST, ORDER_POPULAR_TO_LEAST):
+            chip_to_use = "oldest" if order == ORDER_OLDEST_TO_LATEST else "popular"
             try:
-                # Fast resolve channel metadata (id, name, banner, logo)
-                c_id, c_name, c_url, b_url, l_url = self._resolve_channel_metadata(target_url)
+                c_id, c_name, c_url, b_url, l_url, _ = self._resolve_channel_metadata(target_url)
                 if c_name:
                     self.channel_name = c_name
                 if c_url:
@@ -143,32 +182,35 @@ class ChannelFetcher:
                     self.logo_url = l_url
 
                 if c_id:
-                    oldest_candidates = self._fetch_channel_oldest_innertube(
+                    chip_candidates = self._fetch_channel_chip_innertube(
                         channel_id=c_id,
                         channel_name=self.channel_name,
                         channel_url=self.channel_url,
+                        chip_name=chip_to_use,
                         max_results=max_results,
                     )
-                    if oldest_candidates:
+                    if chip_candidates:
                         logger.info(
-                            f"Successfully fetched {len(oldest_candidates)} true oldest videos via Innertube "
-                            f"(V1: {oldest_candidates[0].title})."
+                            f"Successfully fetched {len(chip_candidates)} videos via Innertube '{chip_to_use}' chip "
+                            f"(V1: {chip_candidates[0].title})."
                         )
-                        return oldest_candidates
+                        return chip_candidates
             except Exception as e:
-                logger.warning(f"Innertube oldest fetch fallback to yt-dlp: {e}")
+                logger.warning(f"Innertube '{chip_to_use}' fetch fallback to yt-dlp: {e}")
 
         # -----------------------------------------------------------------
         # 2. Default yt-dlp fetch (used for Latest order, playlists, or fallback)
         # -----------------------------------------------------------------
         opts = dict(self.ydl_opts)
-        # Only cap yt-dlp playlistend if latest order (for oldest order we need all to reverse if falling back)
+        if force_refresh:
+            opts["no_cache_dir"] = True
+
+        # Only cap yt-dlp playlistend if latest order
         if order == ORDER_LATEST_TO_OLDEST and max_results is not None and int(max_results) > 0:
             opts["playlistend"] = int(max_results)
-        elif order == ORDER_OLDEST_TO_LATEST:
-            # If falling back for oldest order on yt-dlp, extract up to max_results or 200 to safely reverse
+        elif order in (ORDER_OLDEST_TO_LATEST, ORDER_POPULAR_TO_LEAST, ORDER_LEAST_TO_POPULAR):
             if max_results is not None and int(max_results) > 0:
-                opts["playlistend"] = max(int(max_results) * 2, 100)
+                opts["playlistend"] = max(int(max_results) * 3, 150)
             else:
                 opts.pop("playlistend", None)
         else:
@@ -241,7 +283,7 @@ class ChannelFetcher:
         return candidates
 
     def _resolve_channel_metadata(self, channel_url: str):
-        """Quickly resolves channel ID, name, URL, banner, and logo via yt-dlp."""
+        """Quickly resolves channel ID, name, URL, banner, logo, and video count via yt-dlp."""
         opts = {
             "extract_flat": True,
             "skip_download": True,
@@ -254,6 +296,7 @@ class ChannelFetcher:
             c_id = info.get("channel_id") or info.get("id") or ""
             c_name = info.get("channel") or info.get("uploader") or ""
             c_url = info.get("channel_url") or info.get("uploader_url") or channel_url
+            vid_count = info.get("playlist_count") or info.get("video_count") or None
 
             banner_url = ""
             logo_url = ""
@@ -271,18 +314,31 @@ class ChannelFetcher:
                     if not logo_url:
                         logo_url = t_url
 
-            return c_id, c_name, c_url, banner_url, logo_url
+            return c_id, c_name, c_url, banner_url, logo_url, vid_count
 
-    def _fetch_channel_oldest_innertube(
+    def fetch_channel_summary(self, url: str) -> Dict[str, Any]:
+        """Resolves basic channel summary: name, url, banner, logo, and video count."""
+        c_id, c_name, c_url, b_url, l_url, vid_count = self._resolve_channel_metadata(url)
+        return {
+            "channel_id": c_id,
+            "channel_name": c_name,
+            "channel_url": c_url,
+            "banner_url": b_url,
+            "logo_url": l_url,
+            "video_count": vid_count,
+        }
+
+    def _fetch_channel_chip_innertube(
         self,
         channel_id: str,
         channel_name: str,
         channel_url: str,
+        chip_name: str = "oldest",
         max_results: Optional[int] = None,
     ) -> List[ChannelCandidate]:
         """
-        Uses YouTube's official Innertube 'Oldest' browse chip to retrieve the channel's
-        true chronological oldest uploads, guaranteeing V1 is the channel's first video ever uploaded.
+        Uses YouTube's official Innertube browse chips (e.g. 'Oldest' or 'Popular') to retrieve
+        videos in guaranteed server-side order.
         """
         url = "https://www.youtube.com/youtubei/v1/browse?prettyPrint=false"
         headers = {
@@ -314,31 +370,38 @@ class ChannelFetcher:
             logger.debug(f"Innertube videos tab request failed: {e}")
             return []
 
-        # 2. Find Oldest chip continuation token
-        oldest_token = None
+        # 2. Find chip continuation token
+        target_token = None
         tabs = res1.get("contents", {}).get("twoColumnBrowseResultsRenderer", {}).get("tabs", [])
         for tab in tabs:
             tab_r = tab.get("tabRenderer", {})
             chips = tab_r.get("content", {}).get("richGridRenderer", {}).get("header", {}).get("chipBarViewModel", {}).get("chips", [])
             for c in chips:
                 vm = c.get("chipViewModel", {})
-                if vm.get("text", "").strip().lower() == "oldest":
-                    oldest_token = (
+                txt_chip = vm.get("text", "").strip().lower()
+                target_match = False
+                if chip_name == "oldest" and txt_chip == "oldest":
+                    target_match = True
+                elif chip_name == "popular" and (txt_chip in ("popular", "most popular") or "popular" in txt_chip):
+                    target_match = True
+
+                if target_match:
+                    target_token = (
                         vm.get("tapCommand", {})
                         .get("innertubeCommand", {})
                         .get("continuationCommand", {})
                         .get("token")
                     )
                     break
-            if oldest_token:
+            if target_token:
                 break
 
-        if not oldest_token:
-            logger.debug("No 'Oldest' chip continuation token in YouTube response.")
+        if not target_token:
+            logger.debug(f"No '{chip_name}' chip continuation token in YouTube response.")
             return []
 
         candidates: List[ChannelCandidate] = []
-        token = oldest_token
+        token = target_token
         seen_ids = set()
 
         while token and (max_results is None or len(candidates) < max_results):
@@ -358,7 +421,7 @@ class ChannelFetcher:
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     res = json.loads(resp.read().decode("utf-8"))
             except Exception as e:
-                logger.debug(f"Innertube oldest continuation failed: {e}")
+                logger.debug(f"Innertube continuation failed: {e}")
                 break
 
             next_token = None
@@ -386,12 +449,17 @@ class ChannelFetcher:
 
                         # Extract relative date or view count
                         date_str = ""
+                        view_cnt = 0
+                        view_str = ""
                         meta_rows = meta.get("metadata", {}).get("contentMetadataViewModel", {}).get("metadataRows", [])
                         for r in meta_rows:
                             for p in r.get("metadataParts", []):
                                 txt = p.get("text", {}).get("content", "")
                                 if "ago" in txt:
                                     date_str = txt
+                                elif "view" in txt.lower():
+                                    view_str = txt
+                                    view_cnt = _parse_views_to_int(txt)
 
                         if cid and cid not in seen_ids:
                             seen_ids.add(cid)
@@ -409,6 +477,8 @@ class ChannelFetcher:
                                 version_label=f"V{idx}",
                                 version_num=idx,
                                 original_index=idx,
+                                view_count=view_cnt,
+                                view_count_str=view_str or (f"{view_cnt:,}" if view_cnt else ""),
                             )
                             candidates.append(cand)
                             if max_results and len(candidates) >= max_results:
@@ -424,14 +494,36 @@ class ChannelFetcher:
 
         return candidates
 
+    def _fetch_channel_oldest_innertube(
+        self,
+        channel_id: str,
+        channel_name: str,
+        channel_url: str,
+        max_results: Optional[int] = None,
+    ) -> List[ChannelCandidate]:
+        """Backward-compatible method mapping to _fetch_channel_chip_innertube with chip_name='oldest'."""
+        return self._fetch_channel_chip_innertube(
+            channel_id=channel_id,
+            channel_name=channel_name,
+            channel_url=channel_url,
+            chip_name="oldest",
+            max_results=max_results,
+        )
+
     @staticmethod
     def sort_candidates(candidates: List[ChannelCandidate], order: str = ORDER_LATEST_TO_OLDEST) -> List[ChannelCandidate]:
         """
-        Sorts candidates by chronological order and dynamically updates V1, V2, V3... numbering:
+        Sorts candidates by chronological or popularity order and dynamically updates V1, V2, V3... numbering:
         - ORDER_LATEST_TO_OLDEST (Newest to Oldest): index 1 is newest (V1=Newest).
         - ORDER_OLDEST_TO_LATEST (Oldest to Newest): index 1 is oldest (V1=Oldest).
+        - ORDER_POPULAR_TO_LEAST (Most Popular to Least Popular): index 1 is highest view count (V1=Most Popular).
+        - ORDER_LEAST_TO_POPULAR (Least Popular to Most Popular): index 1 is lowest view count (V1=Least Popular).
         """
-        if order == ORDER_OLDEST_TO_LATEST:
+        if order == ORDER_POPULAR_TO_LEAST:
+            candidates.sort(key=lambda c: c.view_count, reverse=True)
+        elif order == ORDER_LEAST_TO_POPULAR:
+            candidates.sort(key=lambda c: c.view_count, reverse=False)
+        elif order == ORDER_OLDEST_TO_LATEST:
             candidates.sort(key=lambda c: c.original_index, reverse=False)
         else:
             candidates.sort(key=lambda c: c.original_index, reverse=False)

@@ -4,7 +4,7 @@ Parses user-specified ranges such as '1-10', '1–25', '20–30', '47–52', 'V1
 """
 
 import re
-from typing import Set, List, Optional, Tuple
+from typing import Set, List, Optional, Tuple, Any
 
 
 class VRangeParser:
@@ -30,9 +30,13 @@ class VRangeParser:
                 return set(range(1, max_limit + 1))
             return set()
 
-        # Normalize 'to', 'through', en-dash '–', em-dash '—' to '-'
+        # Normalize 'to', 'through', en-dash '–', em-dash '—'
         text = re.sub(r"\s*(?:to|through)\s*", "-", text, flags=re.IGNORECASE)
         text = text.replace("–", "-").replace("—", "-")
+        # Normalize union '+' between expressions e.g. "V1-V10 + V25-V35" -> "V1-V10, V25-V35"
+        # but preserve suffix '+' like "V31+" or "31+"
+        text = re.sub(r"\s+\+\s*", ",", text)
+        text = re.sub(r"(?<!\d)\+\s*", ",", text)
 
         # Split by comma, semicolon, or whitespace outside ranges
         chunks = re.split(r"[,;\s]+", text)
@@ -41,6 +45,17 @@ class VRangeParser:
         for chunk in chunks:
             chunk = chunk.strip()
             if not chunk:
+                continue
+
+            # Check open-ended range like "V31+" or "31+"
+            if chunk.endswith("+"):
+                s_digits = re.sub(r"[^\d]", "", chunk)
+                if s_digits.isdigit():
+                    s_val = int(s_digits)
+                    e_val = max_limit if (max_limit is not None and max_limit >= s_val) else (s_val + 500)
+                    for num in range(s_val, e_val + 1):
+                        if num > 0:
+                            result.add(num)
                 continue
 
             # Check if range e.g. "V1-V10" or "1-10" or "20-30" or "47-52"
@@ -69,6 +84,50 @@ class VRangeParser:
                             result.add(num)
 
         return result
+
+    @staticmethod
+    def filter_candidates(
+        candidates: List[Any],
+        include_spec: Optional[str] = None,
+        exclude_spec: Optional[str] = None,
+    ) -> List[Any]:
+        """
+        Filters candidate list based on user include and exclude V-range specs.
+        Supports compound specs:
+            include_spec: 'V1-V30', 'V1-V10 + V25-V35', 'V31+'
+            exclude_spec: 'V1-V10, V20-V22'
+        """
+        if not candidates:
+            return []
+
+        max_limit = len(candidates)
+        include_nums = None
+        if include_spec and include_spec.strip():
+            parsed_inc = VRangeParser.parse(include_spec, max_limit=max_limit)
+            if parsed_inc:
+                include_nums = parsed_inc
+
+        exclude_nums = set()
+        if exclude_spec and exclude_spec.strip():
+            parsed_exc = VRangeParser.parse(exclude_spec, max_limit=max_limit)
+            if parsed_exc:
+                exclude_nums = parsed_exc
+
+        filtered = []
+        for cand in candidates:
+            v_num = getattr(cand, "version_num", None)
+            if v_num is None:
+                v_lbl = getattr(cand, "version_label", "")
+                m = re.search(r"\d+", v_lbl)
+                v_num = int(m.group()) if m else getattr(cand, "original_index", 1)
+
+            if include_nums is not None and v_num not in include_nums:
+                continue
+            if v_num in exclude_nums:
+                continue
+            filtered.append(cand)
+
+        return filtered
 
     @staticmethod
     def parse_fetch_query(query: str) -> Tuple[Optional[int], Optional[Set[int]]]:

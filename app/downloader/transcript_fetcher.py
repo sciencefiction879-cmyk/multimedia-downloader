@@ -22,8 +22,9 @@ class TranscriptFetcher:
         Cleans transcript text for voiceover:
         1. Strips all timestamps (e.g. 00:15, 01:23:45, [02:30], etc.)
         2. Strips bracketed audio annotations: [Music], [Applause], [Laughter], [Cheering], etc.
-        3. Strips competitor personal info / CTAs (Subscribe, Like, Comment, Bell icon, Social media links, Patreon, Sponsors, Merch).
-        4. Formats clean narrative sentences into readable paragraphs (double newlines between 3-4 sentences).
+        3. Strips hashtags (#tag, #shorts, etc.)
+        4. Strips competitor personal info / CTAs (Subscribe, Like, Comment, Bell icon, Social media links, Patreon, Sponsors, Merch).
+        5. Formats clean narrative sentences into readable paragraphs (double newlines between 3-4 sentences).
         """
         if not raw_text:
             return ""
@@ -43,10 +44,16 @@ class TranscriptFetcher:
             flags=re.IGNORECASE,
         )
 
-        # 3. Clean extra whitespace
+        # 3. Remove hashtags (#word, #shorts, #trending, etc.)
+        text = re.sub(r"#[A-Za-z0-9_]+", "", text)
+
+        # 4. Remove any word count or competitor label patterns if present
+        text = re.sub(r"(?:V\d+\s+)?(?:Competitor\s+)?(?:Script\s+)?Word\s*Count:\s*[\d,]+", "", text, flags=re.IGNORECASE)
+
+        # 5. Clean extra whitespace
         text = re.sub(r"\s+", " ", text).strip()
 
-        # 4. Split into clean sentences
+        # 6. Split into clean sentences
         raw_sentences = re.split(r"(?<=[.!?])\s+", text)
         cleaned_sentences = []
 
@@ -83,7 +90,7 @@ class TranscriptFetcher:
         if not cleaned_sentences:
             return ""
 
-        # 5. Group into readable paragraphs (3-4 sentences per paragraph)
+        # 7. Group into readable paragraphs (3-4 sentences per paragraph)
         paragraphs = []
         curr_para = []
         for s in cleaned_sentences:
@@ -96,6 +103,26 @@ class TranscriptFetcher:
             paragraphs.append(" ".join(curr_para))
 
         return "\n\n".join(paragraphs)
+
+    @staticmethod
+    def validate_script_content(text: Optional[str]) -> Tuple[bool, str]:
+        """
+        Validates if transcript content is genuine and usable:
+        - Must not be None or empty
+        - Must have at least 20 characters of readable text
+        - Must not be a placeholder like '[No transcript...' or '[Error...'
+        - Must contain actual words
+        Returns (is_valid, reason)
+        """
+        if not text:
+            return False, "Script content is empty"
+        s = text.strip()
+        if s.startswith("[No transcript") or s.startswith("[Transcript error") or s.startswith("[Error"):
+            return False, "Placeholder or error text instead of genuine transcript"
+        clean_words = [w for w in re.split(r"\s+", s) if re.search(r"[a-zA-Z0-9]", w)]
+        if len(clean_words) < 5 or len(s) < 20:
+            return False, f"Transcript content too short ({len(clean_words)} words, {len(s)} chars)"
+        return True, "Valid transcript"
 
 
     @staticmethod
@@ -385,18 +412,21 @@ class TranscriptFetcher:
     @staticmethod
     def format_script_with_metadata(text: str, version_label: str = "V1") -> str:
         """
-        Formats competitor script with:
-        <Version>
-        Competitor Script Word Count: <count>
-
-        <Narrative text>
+        Formats downloaded script for saving:
+        Eliminates Competitor Script Word Count line and metadata headers completely.
+        Returns pure, clean narrative paragraphs.
         """
-        clean_body = text.strip() if text else ""
-        if clean_body.startswith(f"{version_label}\nCompetitor Script Word Count:"):
-            return clean_body + "\n"
-
-        words = len(clean_body.split()) if clean_body and not clean_body.startswith("[No transcript") else 0
-        return f"{version_label}\nCompetitor Script Word Count: {words:,}\n\n{clean_body}\n"
+        if not text:
+            return ""
+        clean_body = text.strip()
+        # Remove any word count or competitor lines
+        clean_body = re.sub(r"^(?:V\d+\s*)?(?:Competitor\s+)?(?:Script\s+)?Word\s*Count:\s*[\d,]+\s*\n*", "", clean_body, flags=re.IGNORECASE)
+        # Remove any stray V-header line like "V1\n"
+        clean_body = re.sub(r"^V\d+\s*\n+", "", clean_body)
+        # Strip hashtags if any
+        clean_body = re.sub(r"#[A-Za-z0-9_]+", "", clean_body)
+        clean_body = re.sub(r"\n{3,}", "\n\n", clean_body).strip()
+        return clean_body + "\n" if clean_body else ""
 
     @staticmethod
     def export_single_transcript(
@@ -448,9 +478,15 @@ class TranscriptFetcher:
 
             text = transcripts_dict.get(vid_id)
             if not text:
-                text = f"[No transcript available for {title} ({vid_id})]"
+                continue
+            is_valid, _ = TranscriptFetcher.validate_script_content(text)
+            if not is_valid:
+                continue
 
             formatted_content = TranscriptFetcher.format_script_with_metadata(text, v_label)
+            if not formatted_content.strip():
+                continue
+
             txt_file = output_dir / f"{v_label} Script.txt"
             with open(txt_file, "w", encoding="utf-8") as f:
                 f.write(formatted_content)
@@ -481,8 +517,17 @@ class TranscriptFetcher:
                 if use_custom_seq and match_info_dict and vid_id in match_info_dict:
                     v_label = match_info_dict[vid_id].get("version_label", v_label)
 
-                text = transcripts_dict.get(vid_id) or f"[No transcript available for {title}]"
+                text = transcripts_dict.get(vid_id)
+                if not text:
+                    continue
+                is_valid, _ = TranscriptFetcher.validate_script_content(text)
+                if not is_valid:
+                    continue
+
                 formatted_content = TranscriptFetcher.format_script_with_metadata(text, v_label)
+                if not formatted_content.strip():
+                    continue
+
                 zf.writestr(f"{v_label} Script.txt", formatted_content)
 
         logger.info(f"Exported transcripts ZIP to {zip_path}")

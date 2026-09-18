@@ -33,8 +33,8 @@ if not app:
 
 def test_v33_version():
     print("Testing v3.3.0 version bump...")
-    assert APP_VERSION in ("3.3.0", "3.4.0"), f"Expected '3.3.0' or '3.4.0', got '{APP_VERSION}'"
-    print("✓ APP_VERSION is 3.3.0")
+    assert APP_VERSION in ("3.3.0", "3.4.0", "3.5.0"), f"Expected version >= 3.3.0, got '{APP_VERSION}'"
+    print(f"✓ APP_VERSION is {APP_VERSION}")
 
 
 def test_channel_view_parallel_methods():

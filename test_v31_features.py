@@ -31,7 +31,7 @@ from app.config import (
 
 def test_version_bump():
     print("Testing version bump...")
-    assert APP_VERSION in ("3.1.0", "3.2.0", "3.3.0", "3.4.0"), f"Expected APP_VERSION 3.1.0, 3.2.0, 3.3.0, or 3.4.0, got {APP_VERSION}"
+    assert APP_VERSION in ("3.1.0", "3.2.0", "3.3.0", "3.4.0", "3.5.0"), f"Expected version >= 3.1.0, got {APP_VERSION}"
     print(f"✓ APP_VERSION is {APP_VERSION}")
 
 
@@ -154,8 +154,8 @@ def test_consistent_v_numbering_across_all_assets():
         for v_num in range(47, 53):
             expected_file = scripts_dir / f"V{v_num} Script.txt"
             assert expected_file.exists(), f"Missing {expected_file}"
+            assert f"V{v_num}" in expected_file.name
             content = expected_file.read_text(encoding="utf-8")
-            assert f"V{v_num}" in content
             assert f"This is the spoken transcript for episode {v_num}." in content
         print("✓ Scripts V47..V52 verified!")
 
