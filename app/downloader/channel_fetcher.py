@@ -110,6 +110,27 @@ def _parse_views_to_int(view_text: str) -> int:
         return 0
 
 
+def parse_view_count_input(val: Any) -> Optional[int]:
+    """Parses user-entered view thresholds like '100k', '500K', '1M', '1,000,000', '50000', '100K+' into integer. Returns None if empty or invalid."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return int(val) if val >= 0 else None
+    s = str(val).strip().lower().replace(",", "").replace("views", "").replace("view", "").replace("+", "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("k"):
+            return int(float(s[:-1].strip()) * 1_000)
+        if s.endswith("m"):
+            return int(float(s[:-1].strip()) * 1_000_000)
+        if s.endswith("b"):
+            return int(float(s[:-1].strip()) * 1_000_000_000)
+        return int(float(s))
+    except (ValueError, TypeError):
+        return None
+
+
 def _parse_duration_to_sec(dur_str: str) -> float:
     if not dur_str:
         return 0.0
@@ -148,8 +169,13 @@ class ChannelFetcher:
         max_results: Optional[int] = 50,
         order: str = ORDER_LATEST_TO_OLDEST,
         force_refresh: bool = False,
+        min_views: Optional[int] = None,
+        max_views: Optional[int] = None,
     ) -> List[ChannelCandidate]:
-        logger.info(f"Fetching channel/playlist videos from: {url} (max: {max_results}, order: {order}, force: {force_refresh})")
+        logger.info(
+            f"Fetching channel/playlist videos from: {url} (max: {max_results}, order: {order}, "
+            f"min_views: {min_views}, max_views: {max_views}, force: {force_refresh})"
+        )
 
         # Reset channel info
         self.channel_name = ""
@@ -168,6 +194,9 @@ class ChannelFetcher:
         #    - ORDER_OLDEST_TO_LATEST -> "Oldest" chip
         #    - ORDER_POPULAR_TO_LEAST -> "Popular" chip
         # -----------------------------------------------------------------
+        has_view_filter = (min_views is not None) or (max_views is not None)
+        fetch_limit = max(int(max_results) * 5, 250) if (has_view_filter and max_results) else max_results
+
         if is_channel_url and order in (ORDER_OLDEST_TO_LATEST, ORDER_POPULAR_TO_LEAST):
             chip_to_use = "oldest" if order == ORDER_OLDEST_TO_LATEST else "popular"
             try:
@@ -187,12 +216,18 @@ class ChannelFetcher:
                         channel_name=self.channel_name,
                         channel_url=self.channel_url,
                         chip_name=chip_to_use,
-                        max_results=max_results,
+                        max_results=fetch_limit,
                     )
                     if chip_candidates:
+                        chip_candidates = self.filter_and_sort_candidates(
+                            chip_candidates, order=order, min_views=min_views, max_views=max_views
+                        )
+                        if max_results and len(chip_candidates) > int(max_results):
+                            chip_candidates = chip_candidates[: int(max_results)]
+                            self.reassign_version_labels(chip_candidates)
                         logger.info(
                             f"Successfully fetched {len(chip_candidates)} videos via Innertube '{chip_to_use}' chip "
-                            f"(V1: {chip_candidates[0].title})."
+                            f"(V1: {chip_candidates[0].title if chip_candidates else 'None'})."
                         )
                         return chip_candidates
             except Exception as e:
@@ -205,12 +240,12 @@ class ChannelFetcher:
         if force_refresh:
             opts["no_cache_dir"] = True
 
-        # Only cap yt-dlp playlistend if latest order
-        if order == ORDER_LATEST_TO_OLDEST and max_results is not None and int(max_results) > 0:
+        # Only cap yt-dlp playlistend if latest order without view filter
+        if order == ORDER_LATEST_TO_OLDEST and not has_view_filter and max_results is not None and int(max_results) > 0:
             opts["playlistend"] = int(max_results)
-        elif order in (ORDER_OLDEST_TO_LATEST, ORDER_POPULAR_TO_LEAST, ORDER_LEAST_TO_POPULAR):
+        elif order in (ORDER_OLDEST_TO_LATEST, ORDER_POPULAR_TO_LEAST, ORDER_LEAST_TO_POPULAR) or has_view_filter:
             if max_results is not None and int(max_results) > 0:
-                opts["playlistend"] = max(int(max_results) * 3, 150)
+                opts["playlistend"] = max(int(max_results) * 5, 250)
             else:
                 opts.pop("playlistend", None)
         else:
@@ -272,8 +307,10 @@ class ChannelFetcher:
             if cand.video_id:
                 candidates.append(cand)
 
-        # Apply sorting:
-        self.sort_candidates(candidates, order=order)
+        # Apply view count filter and sorting:
+        candidates = self.filter_and_sort_candidates(
+            candidates, order=order, min_views=min_views, max_views=max_views
+        )
 
         if max_results and len(candidates) > int(max_results):
             candidates = candidates[: int(max_results)]
@@ -509,6 +546,38 @@ class ChannelFetcher:
             chip_name="oldest",
             max_results=max_results,
         )
+
+    @staticmethod
+    def filter_and_sort_candidates(
+        candidates: List[ChannelCandidate],
+        order: str = ORDER_LATEST_TO_OLDEST,
+        min_views: Optional[int] = None,
+        max_views: Optional[int] = None,
+    ) -> List[ChannelCandidate]:
+        """
+        Filters candidates by minimum and/or maximum view count thresholds,
+        then sorts them according to order (Most Popular, Least Popular, Oldest, Newest),
+        and reassigns V1, V2, V3... labels sequentially from top to bottom.
+        """
+        filtered = []
+        for c in candidates:
+            if min_views is not None and c.view_count < min_views:
+                continue
+            if max_views is not None and c.view_count > max_views:
+                continue
+            filtered.append(c)
+
+        if order == ORDER_POPULAR_TO_LEAST:
+            filtered.sort(key=lambda c: c.view_count, reverse=True)
+        elif order == ORDER_LEAST_TO_POPULAR:
+            filtered.sort(key=lambda c: c.view_count, reverse=False)
+        elif order == ORDER_OLDEST_TO_LATEST:
+            filtered.sort(key=lambda c: c.original_index, reverse=False)
+        else:
+            filtered.sort(key=lambda c: c.original_index, reverse=False)
+
+        ChannelFetcher.reassign_version_labels(filtered)
+        return filtered
 
     @staticmethod
     def sort_candidates(candidates: List[ChannelCandidate], order: str = ORDER_LATEST_TO_OLDEST) -> List[ChannelCandidate]:

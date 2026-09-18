@@ -29,6 +29,7 @@ class QueueTable(QTableWidget):
     retry_requested = Signal(str)
     resume_requested = Signal(str)
     remove_requested = Signal(str)
+    move_to_front_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(0, 8, parent)
@@ -174,6 +175,13 @@ class QueueTable(QTableWidget):
             btn_resume.clicked.connect(lambda: self.resume_requested.emit(item.id))
             lay.addWidget(btn_resume)
         elif item.status in (DownloadStatus.QUEUED, DownloadStatus.DOWNLOADING, DownloadStatus.FETCHING_INFO):
+            if item.status == DownloadStatus.QUEUED:
+                btn_top = QPushButton("⬆")
+                btn_top.setToolTip("Move to Front (Top Priority)")
+                btn_top.setFixedWidth(28)
+                btn_top.clicked.connect(lambda: self.move_to_front_requested.emit(item.id))
+                lay.addWidget(btn_top)
+
             btn_cancel = QPushButton("⏹")
             btn_cancel.setToolTip("Stop & Cancel Download")
             btn_cancel.setFixedWidth(32)

@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QApplication,
     QSpinBox,
+    QInputDialog,
 )
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtCore import Qt, Signal, QThread, QTimer
@@ -59,7 +60,7 @@ from app.config import (
     ORDER_POPULAR_TO_LEAST,
     ORDER_LEAST_TO_POPULAR,
 )
-from app.downloader.channel_fetcher import ChannelFetcher, ChannelCandidate
+from app.downloader.channel_fetcher import ChannelFetcher, ChannelCandidate, parse_view_count_input
 from app.downloader.transcript_fetcher import TranscriptFetcher
 from app.downloader.metadata_purifier import MetadataPurifier
 from app.downloader.channel_assets_fetcher import ChannelAssetsFetcher
@@ -140,12 +141,22 @@ class MediaFetchThread(QThread):
     finished_signal = Signal(list)
     error_signal = Signal(str)
 
-    def __init__(self, url: str, max_count: Optional[int], order: str, force_refresh: bool = False):
+    def __init__(
+        self,
+        url: str,
+        max_count: Optional[int],
+        order: str,
+        force_refresh: bool = False,
+        min_views: Optional[int] = None,
+        max_views: Optional[int] = None,
+    ):
         super().__init__()
         self.url = url.strip()
         self.max_count = max_count
         self.order = order
         self.force_refresh = force_refresh
+        self.min_views = min_views
+        self.max_views = max_views
         self._is_cancelled = False
 
     def cancel(self):
@@ -174,6 +185,8 @@ class MediaFetchThread(QThread):
                 max_results=self.max_count,
                 order=self.order,
                 force_refresh=self.force_refresh,
+                min_views=self.min_views,
+                max_views=self.max_views,
             )
             if not self._is_cancelled:
                 self.finished_signal.emit(candidates)
@@ -517,6 +530,7 @@ class ChannelView(QWidget):
         self.settings = settings
         self.fetcher = ChannelFetcher()
 
+        self.all_fetched_candidates: List[ChannelCandidate] = []
         self.candidates: List[ChannelCandidate] = []
         self.transcripts_dict: Dict[str, str] = {}  # video_id -> text
         self.metadata_dict: Dict[str, Dict[str, Any]] = {}  # video_id -> metadata info
@@ -547,11 +561,11 @@ class ChannelView(QWidget):
         layout.setSpacing(14)
 
         # Header
-        lbl_title = QLabel("Channel & Media Downloader Pro v3.5")
+        lbl_title = QLabel("Channel & Media Downloader Pro v3.6")
         lbl_title.setObjectName("viewTitle")
         lbl_sub = QLabel(
             "Unified YouTube data extractor with Chronological & Popularity V-Numbering (Newest, Oldest, Most Popular, Least Popular), "
-            "Selective V-Range Skip & Download, Zero Competitor Word-Count Scripts, 5-Retry Auto Recovery, and Concurrent Scripts & Audio."
+            "View Count Filtering (Min/Max Views), Selective V-Range Skip & Download, Zero Competitor Word-Count Scripts, 5-Retry Auto Recovery, and Concurrent Scripts & Audio."
         )
         lbl_sub.setWordWrap(True)
         lbl_sub.setObjectName("viewSubtitle")
@@ -620,6 +634,64 @@ class ChannelView(QWidget):
         fetch_btn_row.addWidget(self.btn_clear_all)
         fetch_layout.addLayout(fetch_btn_row, 1, 4)
 
+        # Row 2: View Count Filter (Works with Popularity and Chronological Sorting)
+        fetch_layout.addWidget(QLabel("👁 View Count Filter:"), 2, 0)
+        
+        view_filter_row = QHBoxLayout()
+        view_filter_row.setSpacing(6)
+        
+        self.txt_min_views = QLineEdit()
+        self.txt_min_views.setPlaceholderText("Min Views (e.g. 100K, 500,000)")
+        self.txt_min_views.setToolTip("Filter videos with at least this many views (e.g. 100K, 500,000, 1M). Applied before V-numbering.")
+        self.txt_min_views.returnPressed.connect(self._apply_view_filter_and_sort)
+        
+        lbl_to = QLabel("to")
+        lbl_to.setStyleSheet("color: #8e8e93; font-weight: 600;")
+        
+        self.txt_max_views = QLineEdit()
+        self.txt_max_views.setPlaceholderText("Max Views (e.g. 1M, 2,000,000)")
+        self.txt_max_views.setToolTip("Filter videos with at most this many views (e.g. 1M, 2,000,000). Applied before V-numbering.")
+        self.txt_max_views.returnPressed.connect(self._apply_view_filter_and_sort)
+        
+        view_filter_row.addWidget(self.txt_min_views, 1)
+        view_filter_row.addWidget(lbl_to)
+        view_filter_row.addWidget(self.txt_max_views, 1)
+        fetch_layout.addLayout(view_filter_row, 2, 1, 1, 2)
+        
+        self.lbl_unavailable_count = QLabel("Unavailable/Private: 0")
+        self.lbl_unavailable_count.setStyleSheet("color: #8e8e93; font-size: 11px;")
+        fetch_layout.addWidget(self.lbl_unavailable_count, 2, 3)
+        
+        # View count quick presets & Apply
+        view_btn_row = QHBoxLayout()
+        view_btn_row.setSpacing(4)
+        
+        btn_v_100k = QPushButton("100K+")
+        btn_v_100k.setToolTip("Quick preset: 100,000+ views")
+        btn_v_100k.clicked.connect(lambda: self._set_view_filter_preset("100K", ""))
+        
+        btn_v_500k = QPushButton("500K-2M")
+        btn_v_500k.setToolTip("Quick preset: 500,000 to 2,000,000 views")
+        btn_v_500k.clicked.connect(lambda: self._set_view_filter_preset("500K", "2M"))
+        
+        btn_v_less100k = QPushButton("< 100K")
+        btn_v_less100k.setToolTip("Quick preset: less than 100,000 views")
+        btn_v_less100k.clicked.connect(lambda: self._set_view_filter_preset("", "100K"))
+        
+        btn_v_apply = QPushButton("⚡ Apply Filter")
+        btn_v_apply.setStyleSheet("background-color: #007aff; color: #ffffff; font-weight: 700;")
+        btn_v_apply.clicked.connect(self._apply_view_filter_and_sort)
+        
+        btn_v_clear = QPushButton("✕ Clear")
+        btn_v_clear.clicked.connect(lambda: self._set_view_filter_preset("", ""))
+        
+        view_btn_row.addWidget(btn_v_100k)
+        view_btn_row.addWidget(btn_v_500k)
+        view_btn_row.addWidget(btn_v_less100k)
+        view_btn_row.addWidget(btn_v_apply)
+        view_btn_row.addWidget(btn_v_clear)
+        fetch_layout.addLayout(view_btn_row, 2, 4)
+
         # Auto-fetch debounced timer
         self.auto_fetch_timer = QTimer(self)
         self.auto_fetch_timer.setSingleShot(True)
@@ -640,6 +712,24 @@ class ChannelView(QWidget):
         lbl_sel_info = QLabel("Sequential Phased Pipeline (Titles → Thumbnails → Assets → Parallel Scripts & Audio), saved live in real-time:")
         lbl_sel_info.setStyleSheet("color: #007aff; font-weight: 600;")
         sel_layout.addWidget(lbl_sel_info)
+
+        # Preset Management Bar
+        preset_bar = QHBoxLayout()
+        preset_bar.setSpacing(8)
+        lbl_presets_head = QLabel("⚙️ <b>Selection Preset:</b>")
+        lbl_presets_head.setStyleSheet("color: #007aff;")
+        self.combo_presets = QComboBox()
+        self._refresh_presets_combo()
+        self.combo_presets.currentIndexChanged.connect(self._on_preset_dropdown_changed)
+        
+        self.btn_save_preset = QPushButton("💾 Save Preset...")
+        self.btn_save_preset.setToolTip("Save current custom checkbox selection as a new named preset")
+        self.btn_save_preset.clicked.connect(self._on_save_preset_clicked)
+        
+        preset_bar.addWidget(lbl_presets_head)
+        preset_bar.addWidget(self.combo_presets, 1)
+        preset_bar.addWidget(self.btn_save_preset)
+        sel_layout.addLayout(preset_bar)
 
         # Skip / Exclude Range Bar (Requirement 8)
         skip_frame = QFrame()
@@ -675,11 +765,13 @@ class ChannelView(QWidget):
         l_title.addWidget(self.chk_titles_linked)
         grid_sel.addWidget(w_title, 0, 0)
 
-        # 2. Thumbnails with custom total count
+        # 2. Thumbnails with custom total count and custom V-range
         w_thumb = QWidget()
-        l_thumb = QHBoxLayout(w_thumb)
+        l_thumb = QVBoxLayout(w_thumb)
         l_thumb.setContentsMargins(0, 0, 0, 0)
-        l_thumb.setSpacing(6)
+        l_thumb.setSpacing(3)
+        l_thumb_top = QHBoxLayout()
+        l_thumb_top.setSpacing(6)
         self.chk_thumbnails = QCheckBox("2. Thumbnails (Thumbnails/)")
         self.chk_thumbnails.setChecked(True)
         self.chk_thumbnails.setToolTip("Highest resolution thumbnails named V1 Thumbnail.jpg, V2 Thumbnail.jpg...")
@@ -690,10 +782,16 @@ class ChannelView(QWidget):
         self.spin_thumb_count.setValue(50)
         self.spin_thumb_count.setToolTip("Custom select total number of video thumbnails to download (e.g. 10, 25, 50, all)")
         self.spin_thumb_count.valueChanged.connect(self._on_thumb_count_changed)
-        l_thumb.addWidget(self.chk_thumbnails)
-        l_thumb.addWidget(self.lbl_thumb_count)
-        l_thumb.addWidget(self.spin_thumb_count)
-        l_thumb.addStretch()
+        l_thumb_top.addWidget(self.chk_thumbnails)
+        l_thumb_top.addWidget(self.lbl_thumb_count)
+        l_thumb_top.addWidget(self.spin_thumb_count)
+        l_thumb_top.addStretch()
+        l_thumb.addLayout(l_thumb_top)
+
+        self.txt_thumb_v_range = QLineEdit()
+        self.txt_thumb_v_range.setPlaceholderText("Custom Thumbnail Range (e.g. V1-V20, empty = all)")
+        self.txt_thumb_v_range.setStyleSheet("font-size: 11px;")
+        l_thumb.addWidget(self.txt_thumb_v_range)
         grid_sel.addWidget(w_thumb, 0, 1)
 
         # 3. Channel Assets
@@ -764,13 +862,42 @@ class ChannelView(QWidget):
         l_audio.addWidget(self.txt_audio_v_range)
         grid_sel.addWidget(w_audio, 1, 1)
 
-        # 6. Videos
+        # 6. Videos with custom V-range
+        w_video = QWidget()
+        l_video = QVBoxLayout(w_video)
+        l_video.setContentsMargins(0, 0, 0, 0)
+        l_video.setSpacing(3)
         self.chk_videos = QCheckBox("6. Videos (Videos/ folder: V1.mp4...)")
-        self.chk_videos.setChecked(False)  # Unchecked by default to save bandwidth unless explicitly wanted
+        self.chk_videos.setChecked(False)
         self.chk_videos.setToolTip("Downloads actual video files (MP4) named V1.mp4, V2.mp4... at selected quality")
-        grid_sel.addWidget(self.chk_videos, 1, 2)
+        l_video.addWidget(self.chk_videos)
+
+        self.txt_video_v_range = QLineEdit()
+        self.txt_video_v_range.setPlaceholderText("Custom Video Range (e.g. V1-V10, empty = all)")
+        self.txt_video_v_range.setStyleSheet("font-size: 11px;")
+        l_video.addWidget(self.txt_video_v_range)
+        grid_sel.addWidget(w_video, 1, 2)
 
         sel_layout.addLayout(grid_sel)
+
+        # Master Operational Modes (Missing Only vs Force Overwrite)
+        modes_row = QHBoxLayout()
+        modes_row.setSpacing(16)
+        self.chk_mode_missing_only = QCheckBox("⚡ Download Missing Only (Skip Completed)")
+        self.chk_mode_missing_only.setChecked(True)
+        self.chk_mode_missing_only.setToolTip("Strictly downloads missing files and skips all valid completed files on disk")
+
+        self.chk_mode_force_overwrite = QCheckBox("🔄 Force Redownload / Overwrite All")
+        self.chk_mode_force_overwrite.setChecked(False)
+        self.chk_mode_force_overwrite.setToolTip("Forces redownloading and overwriting of all selected files even if present")
+
+        self.chk_mode_missing_only.toggled.connect(lambda checked: self.chk_mode_force_overwrite.setChecked(False) if checked else None)
+        self.chk_mode_force_overwrite.toggled.connect(lambda checked: self.chk_mode_missing_only.setChecked(False) if checked else None)
+
+        modes_row.addWidget(self.chk_mode_missing_only)
+        modes_row.addWidget(self.chk_mode_force_overwrite)
+        modes_row.addStretch()
+        sel_layout.addLayout(modes_row)
 
         # Selection presets and Launch / Resume Buttons
         bottom_sel_row = QHBoxLayout()
@@ -802,15 +929,36 @@ class ChannelView(QWidget):
 
         bottom_sel_row.addStretch()
 
-        self.btn_resume_download = QPushButton("⏯ RESUME DOWNLOAD")
+        self.btn_regenerate_titles = QPushButton("📝 Regenerate Titles.txt")
+        self.btn_regenerate_titles.setToolTip("Re-exports Titles.txt for selected candidates directly into folder without downloading media")
+        self.btn_regenerate_titles.clicked.connect(self._regenerate_titles_clicked)
+        bottom_sel_row.addWidget(self.btn_regenerate_titles)
+
+        self.btn_sync_channel = QPushButton("🔄 SYNC CHANNEL")
+        self.btn_sync_channel.setStyleSheet(
+            "background-color: #5856d6; color: #ffffff; font-weight: 800; font-size: 12px; padding: 8px 14px; border-radius: 6px;"
+        )
+        self.btn_sync_channel.setToolTip("Compares local folder with channel, selects only un-downloaded items, and downloads them")
+        self.btn_sync_channel.clicked.connect(self._sync_channel_clicked)
+        bottom_sel_row.addWidget(self.btn_sync_channel)
+
+        self.btn_resume_download = QPushButton("⏯ RESUME")
         self.btn_resume_download.setStyleSheet(
-            "background-color: #ff9500; color: #ffffff; font-weight: 800; font-size: 13px; padding: 8px 16px; border-radius: 6px;"
+            "background-color: #ff9500; color: #ffffff; font-weight: 800; font-size: 12px; padding: 8px 14px; border-radius: 6px;"
         )
         self.btn_resume_download.setToolTip("Resumes download; automatically checks disk and skips already completed files instantly")
         self.btn_resume_download.clicked.connect(self._resume_download_clicked)
         bottom_sel_row.addWidget(self.btn_resume_download)
 
-        self.btn_download_selected = QPushButton("🚀 DOWNLOAD SELECTED DATA")
+        self.btn_smart_download = QPushButton("🌟 SMART DOWNLOAD")
+        self.btn_smart_download.setStyleSheet(
+            "background-color: #30d158; color: #ffffff; font-weight: 800; font-size: 12px; padding: 8px 14px; border-radius: 6px;"
+        )
+        self.btn_smart_download.setToolTip("Master 1-click execution: sort, filter by views, scan disk, download missing assets in parallel, and show full statistics")
+        self.btn_smart_download.clicked.connect(self._smart_download_clicked)
+        bottom_sel_row.addWidget(self.btn_smart_download)
+
+        self.btn_download_selected = QPushButton("🚀 DOWNLOAD SELECTED")
         self.btn_download_selected.setStyleSheet(
             "background-color: #34c759; color: #ffffff; font-weight: 800; font-size: 13px; padding: 8px 18px; border-radius: 6px;"
         )
@@ -993,6 +1141,93 @@ class ChannelView(QWidget):
 
         tbl_layout.addLayout(range_bar)
 
+        # Action Bar: Invert Selection, Select Missing, Select Failed, Select Incomplete, Select Skipped
+        sel_actions_bar = QHBoxLayout()
+        sel_actions_bar.setSpacing(6)
+        lbl_act = QLabel("<b>Actions:</b>")
+        lbl_act.setStyleSheet("color: #8e8e93; font-size: 11px;")
+        sel_actions_bar.addWidget(lbl_act)
+
+        self.btn_invert_sel = QPushButton("Invert Selection")
+        self.btn_invert_sel.setToolTip("Invert checkbox selection states across all matched videos")
+        self.btn_invert_sel.clicked.connect(self._on_invert_selection)
+        sel_actions_bar.addWidget(self.btn_invert_sel)
+
+        self.btn_select_missing = QPushButton("Select Missing Only")
+        self.btn_select_missing.setToolTip("Scans save folder and selects only videos with missing files on disk")
+        self.btn_select_missing.clicked.connect(self._on_select_missing)
+        sel_actions_bar.addWidget(self.btn_select_missing)
+
+        self.btn_select_failed = QPushButton("Select Failed Only")
+        self.btn_select_failed.setToolTip("Selects only videos that previously failed or produced errors")
+        self.btn_select_failed.clicked.connect(self._on_select_failed)
+        sel_actions_bar.addWidget(self.btn_select_failed)
+
+        self.btn_select_incomplete = QPushButton("Select Incomplete Only")
+        self.btn_select_incomplete.setToolTip("Selects partial/corrupt files (<10KB audio / <50KB video / empty scripts)")
+        self.btn_select_incomplete.clicked.connect(self._on_select_incomplete)
+        sel_actions_bar.addWidget(self.btn_select_incomplete)
+
+        self.btn_select_skipped = QPushButton("Select Skipped Only")
+        self.btn_select_skipped.setToolTip("Selects candidates matching skip V-ranges or marked as skipped")
+        self.btn_select_skipped.clicked.connect(self._on_select_skipped)
+        sel_actions_bar.addWidget(self.btn_select_skipped)
+
+        sel_actions_bar.addStretch()
+        tbl_layout.addLayout(sel_actions_bar)
+
+        # Interactive Table Filter Bar (Keyword, Min Views, Duration, Date, Type)
+        filter_bar = QHBoxLayout()
+        filter_bar.setSpacing(8)
+
+        self.txt_filter_keyword = QLineEdit()
+        self.txt_filter_keyword.setPlaceholderText("🔍 Filter by title keyword...")
+        self.txt_filter_keyword.setToolTip("Instant real-time search: filters table rows matching keyword")
+        self.txt_filter_keyword.textChanged.connect(self._apply_table_filters)
+        filter_bar.addWidget(self.txt_filter_keyword, 2)
+
+        self.spin_filter_min_views = QSpinBox()
+        self.spin_filter_min_views.setRange(0, 1000000000)
+        self.spin_filter_min_views.setSingleStep(50000)
+        self.spin_filter_min_views.setPrefix("Min Views: ")
+        self.spin_filter_min_views.setSpecialValueText("Min Views: Any")
+        self.spin_filter_min_views.setToolTip("Filters table rows showing only videos with at least this many views")
+        self.spin_filter_min_views.valueChanged.connect(self._apply_table_filters)
+        filter_bar.addWidget(self.spin_filter_min_views, 1)
+
+        self.spin_filter_min_dur = QSpinBox()
+        self.spin_filter_min_dur.setRange(0, 600)
+        self.spin_filter_min_dur.setPrefix("Min Dur: ")
+        self.spin_filter_min_dur.setSuffix(" min")
+        self.spin_filter_min_dur.setSpecialValueText("Min Dur: 0m")
+        self.spin_filter_min_dur.valueChanged.connect(self._apply_table_filters)
+        filter_bar.addWidget(self.spin_filter_min_dur, 1)
+
+        self.spin_filter_max_dur = QSpinBox()
+        self.spin_filter_max_dur.setRange(0, 600)
+        self.spin_filter_max_dur.setPrefix("Max Dur: ")
+        self.spin_filter_max_dur.setSuffix(" min")
+        self.spin_filter_max_dur.setSpecialValueText("Max Dur: Any")
+        self.spin_filter_max_dur.valueChanged.connect(self._apply_table_filters)
+        filter_bar.addWidget(self.spin_filter_max_dur, 1)
+
+        self.combo_filter_date = QComboBox()
+        self.combo_filter_date.addItems(["All Dates", "Last 30 Days", "Last 3 Months", "Last Year"])
+        self.combo_filter_date.currentTextChanged.connect(self._apply_table_filters)
+        filter_bar.addWidget(self.combo_filter_date, 1)
+
+        self.combo_filter_type = QComboBox()
+        self.combo_filter_type.addItems(["All Types", "Videos Only", "Shorts Only"])
+        self.combo_filter_type.currentTextChanged.connect(self._apply_table_filters)
+        filter_bar.addWidget(self.combo_filter_type, 1)
+
+        btn_reset_filters = QPushButton("✕ Reset")
+        btn_reset_filters.setToolTip("Reset all table search and filter criteria")
+        btn_reset_filters.clicked.connect(self._reset_table_filters)
+        filter_bar.addWidget(btn_reset_filters)
+
+        tbl_layout.addLayout(filter_bar)
+
         self.table = QTableWidget(0, 10)
         headers = ["Sel", "Ver", "Title", "Views", "Duration", "Date", "Copy Title", "Script TXT", "Status", "Action"]
         self.table.setHorizontalHeaderLabels(headers)
@@ -1119,22 +1354,51 @@ class ChannelView(QWidget):
         return count
 
     def _on_order_changed(self):
-        """Dynamic order switch: re-fetches channel so genuine oldest or newest uploads are loaded as V1."""
+        """Dynamic order switch: re-sorts and re-indexes V1..Vn dynamically."""
         order = self.combo_order.currentText()
-        if not self.candidates:
-            return
-        url = self.txt_url.text().strip()
-        if self.fetch_thread and self.fetch_thread.isRunning():
+        if self.all_fetched_candidates:
+            self._apply_view_filter_and_sort(re_filter_from_all=True)
+        elif self.candidates:
+            self._apply_view_filter_and_sort(re_filter_from_all=False)
+
+    def _apply_view_filter_and_sort(self, re_filter_from_all: bool = True):
+        """
+        Filters candidates by minimum and/or maximum view counts,
+        sorts them according to order, and reassigns V1, V2, V3... labels sequentially.
+        """
+        min_v = parse_view_count_input(self.txt_min_views.text()) if hasattr(self, "txt_min_views") else None
+        max_v = parse_view_count_input(self.txt_max_views.text()) if hasattr(self, "txt_max_views") else None
+        order = self.combo_order.currentText()
+
+        source_list = self.all_fetched_candidates if (re_filter_from_all and self.all_fetched_candidates) else self.candidates
+        if not source_list:
             return
 
-        if url:
-            self.lbl_table_status.setText(f"Switching order to {order}... fetching videos.")
-            self._fetch_videos_clicked()
-        else:
-            self.candidates = ChannelFetcher.sort_candidates(self.candidates, order)
-            self._populate_table()
-            self._update_range_status()
-            self.lbl_table_status.setText(f"Re-sorted {len(self.candidates)} videos to {order}. V1 is now the first video in this order.")
+        filtered = ChannelFetcher.filter_and_sort_candidates(
+            list(source_list), order=order, min_views=min_v, max_views=max_v
+        )
+        self.candidates = filtered
+        self._populate_table()
+        self._update_range_status()
+
+        filter_desc = []
+        if min_v is not None:
+            filter_desc.append(f"Min: {min_v:,}")
+        if max_v is not None:
+            filter_desc.append(f"Max: {max_v:,}")
+        desc_str = f" ({', '.join(filter_desc)})" if filter_desc else ""
+        tot_all = len(self.all_fetched_candidates) if self.all_fetched_candidates else len(self.candidates)
+        self.lbl_table_status.setText(
+            f"Showing {len(self.candidates)} of {tot_all} videos matching view count criteria{desc_str}. "
+            f"V1 is the #1 video in {order}."
+        )
+
+    def _set_view_filter_preset(self, min_str: str, max_str: str):
+        if hasattr(self, "txt_min_views"):
+            self.txt_min_views.setText(min_str)
+        if hasattr(self, "txt_max_views"):
+            self.txt_max_views.setText(max_str)
+        self._apply_view_filter_and_sort(re_filter_from_all=True)
 
     def _apply_v_range_clicked(self):
         """Applies V-Number range e.g. '1-10', '1-25', '20-30', '47-52', 'V1-V10', 'V20 to V30', 'V1, V5, V10'."""
@@ -1187,6 +1451,53 @@ class ChannelView(QWidget):
             if 0 <= row < len(self.candidates):
                 self.candidates[row].is_selected = (item.checkState() == Qt.Checked)
                 self._update_range_status()
+
+    # ==================== PRESET MANAGEMENT ====================
+
+    def _refresh_presets_combo(self):
+        if not hasattr(self, "combo_presets"):
+            return
+        self.combo_presets.blockSignals(True)
+        self.combo_presets.clear()
+        self.combo_presets.addItem("Custom Selection...")
+        presets = self.settings.custom_presets or {}
+        for name in presets.keys():
+            self.combo_presets.addItem(name)
+        self.combo_presets.blockSignals(False)
+
+    def _on_preset_dropdown_changed(self, idx: int):
+        if idx <= 0:
+            return
+        name = self.combo_presets.currentText()
+        presets = self.settings.custom_presets or {}
+        cfg = presets.get(name)
+        if not cfg:
+            return
+        self.chk_titles.setChecked(cfg.get("want_titles", True))
+        self.chk_thumbnails.setChecked(cfg.get("want_thumbnails", True))
+        self.chk_channel_assets.setChecked(cfg.get("want_channel_assets", True))
+        self.chk_scripts.setChecked(cfg.get("want_scripts", True))
+        self.chk_mp3s.setChecked(cfg.get("want_mp3s", True))
+        self.chk_videos.setChecked(cfg.get("want_videos", False))
+
+    def _on_save_preset_clicked(self):
+        name, ok = QInputDialog.getText(self, "Save Custom Preset", "Enter a name for this preset:")
+        if ok and name.strip():
+            preset_name = name.strip()
+            if self.settings.custom_presets is None:
+                self.settings.custom_presets = {}
+            self.settings.custom_presets[preset_name] = {
+                "want_titles": self.chk_titles.isChecked(),
+                "want_thumbnails": self.chk_thumbnails.isChecked(),
+                "want_channel_assets": self.chk_channel_assets.isChecked(),
+                "want_scripts": self.chk_scripts.isChecked(),
+                "want_mp3s": self.chk_mp3s.isChecked(),
+                "want_videos": self.chk_videos.isChecked(),
+            }
+            self.settings.save()
+            self._refresh_presets_combo()
+            self.combo_presets.setCurrentText(preset_name)
+            QMessageBox.information(self, "Preset Saved", f"Preset '{preset_name}' saved successfully!")
 
     # ==================== DATA PRESET BUTTONS ====================
 
@@ -1241,10 +1552,14 @@ class ChannelView(QWidget):
         count, auto_select_set = self._get_fetch_params()
         self._pending_auto_select_set = auto_select_set
         order = self.combo_order.currentText()
+        min_v = parse_view_count_input(self.txt_min_views.text()) if hasattr(self, "txt_min_views") else None
+        max_v = parse_view_count_input(self.txt_max_views.text()) if hasattr(self, "txt_max_views") else None
         count_label = f"{count} videos" if count else "All (Unlimited) videos"
         self.lbl_table_status.setText(f"Fetching {count_label} in {order} order...")
 
-        self.fetch_thread = MediaFetchThread(url, count, order, force_refresh=False)
+        self.fetch_thread = MediaFetchThread(
+            url, count, order, force_refresh=False, min_views=min_v, max_views=max_v
+        )
         self.fetch_thread.finished_signal.connect(self._on_fetch_finished)
         self.fetch_thread.error_signal.connect(self._on_fetch_error)
         self.fetch_thread.start()
@@ -1262,10 +1577,14 @@ class ChannelView(QWidget):
         count, auto_select_set = self._get_fetch_params()
         self._pending_auto_select_set = auto_select_set
         order = self.combo_order.currentText()
+        min_v = parse_view_count_input(self.txt_min_views.text()) if hasattr(self, "txt_min_views") else None
+        max_v = parse_view_count_input(self.txt_max_views.text()) if hasattr(self, "txt_max_views") else None
         count_label = f"{count} videos" if count else "All (Unlimited) videos"
         self.lbl_table_status.setText(f"⚡ Force fetching {count_label} in {order} order (bypassing cache)...")
 
-        self.fetch_thread = MediaFetchThread(url, count, order, force_refresh=True)
+        self.fetch_thread = MediaFetchThread(
+            url, count, order, force_refresh=True, min_views=min_v, max_views=max_v
+        )
         self.fetch_thread.finished_signal.connect(self._on_fetch_finished)
         self.fetch_thread.error_signal.connect(self._on_fetch_error)
         self.fetch_thread.start()
@@ -1341,24 +1660,32 @@ class ChannelView(QWidget):
         self._stop_fetch_clicked()
         self._stop_all_batch_threads()
         self.txt_url.clear()
+        self.all_fetched_candidates.clear()
         self.candidates.clear()
         self.transcripts_dict.clear()
         self.metadata_dict.clear()
         self.diagnostics_dict.clear()
         self.table.setRowCount(0)
+        if hasattr(self, "txt_min_views"):
+            self.txt_min_views.clear()
+        if hasattr(self, "txt_max_views"):
+            self.txt_max_views.clear()
+        self._reset_table_filters()
         self.lbl_table_status.setText("Cleared. Paste a link above and click Fetch Videos.")
         self.lbl_range_status.setText("Selected: 0 / 0 videos")
         self.box_transcript_progress.setVisible(False)
         self.btn_view_diagnostics.setVisible(False)
         if hasattr(self, "lbl_total_available_videos"):
             self.lbl_total_available_videos.setText("Channel Videos: —")
+        if hasattr(self, "lbl_unavailable_count"):
+            self.lbl_unavailable_count.setText("Unavailable/Private: 0")
 
     def _on_fetch_finished(self, candidates: List[ChannelCandidate]):
         self.btn_fetch.setEnabled(True)
         if hasattr(self, "btn_force_fetch"):
             self.btn_force_fetch.setEnabled(True)
         self.btn_stop_fetch.setEnabled(False)
-        self.candidates = candidates
+        self.all_fetched_candidates = list(candidates)
         order = self.combo_order.currentText()
 
         # Dynamic smart default concurrency matching total fetched videos count
@@ -1373,6 +1700,16 @@ class ChannelView(QWidget):
             if hasattr(self, "lbl_total_available_videos"):
                 self.lbl_total_available_videos.setText(f"Channel Videos: {count} loaded")
 
+        # Apply view count filter if specified
+        min_v = parse_view_count_input(self.txt_min_views.text()) if hasattr(self, "txt_min_views") else None
+        max_v = parse_view_count_input(self.txt_max_views.text()) if hasattr(self, "txt_max_views") else None
+        if min_v is not None or max_v is not None:
+            self.candidates = ChannelFetcher.filter_and_sort_candidates(
+                list(self.all_fetched_candidates), order=order, min_views=min_v, max_views=max_v
+            )
+        else:
+            self.candidates = candidates
+
         # Apply pending auto-selection if range/count was specified
         pending = getattr(self, "_pending_auto_select_set", None)
         if pending is not None:
@@ -1384,7 +1721,7 @@ class ChannelView(QWidget):
             for cand in self.candidates:
                 cand.is_selected = True
 
-        self.lbl_table_status.setText(f"Loaded {len(candidates)} videos ({order}: V1 is the first video).")
+        self.lbl_table_status.setText(f"Loaded {len(self.candidates)} videos ({order}: V1 is the first video).")
         self._populate_table()
         self._update_range_status()
 
@@ -1395,6 +1732,249 @@ class ChannelView(QWidget):
         self.btn_stop_fetch.setEnabled(False)
         self.lbl_table_status.setText("Fetch failed.")
         QMessageBox.critical(self, "Fetch Error", f"Could not fetch videos: {err_msg}")
+
+    # ==================== TABLE SELECTION & ACTION BUTTONS ====================
+
+    def _on_invert_selection(self):
+        self._is_populating_table = True
+        self.table.blockSignals(True)
+        for row, cand in enumerate(self.candidates):
+            cand.is_selected = not cand.is_selected
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.Checked if cand.is_selected else Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._is_populating_table = False
+        self._update_range_status()
+
+    def _on_select_missing(self):
+        out_dir = Path(self.txt_out_dir.text())
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self._is_populating_table = True
+        self.table.blockSignals(True)
+        for row, cand in enumerate(self.candidates):
+            v_label = cand.version_label
+            is_missing = False
+            if self.chk_scripts.isChecked():
+                script_path = out_dir / "Scripts" / f"{v_label} Script.txt"
+                alt_script = out_dir / f"{v_label} Script.txt"
+                if not script_path.exists() and not alt_script.exists():
+                    is_missing = True
+            if self.chk_mp3s.isChecked():
+                mp3_path = out_dir / "Audio" / f"{v_label}.mp3"
+                alt_mp3 = out_dir / f"{v_label}.mp3"
+                if not mp3_path.exists() and not alt_mp3.exists():
+                    is_missing = True
+            if self.chk_thumbnails.isChecked():
+                thumb_path = out_dir / "Thumbnails" / f"{v_label} Thumbnail.jpg"
+                alt_thumb = out_dir / f"{v_label} Thumbnail.jpg"
+                if not thumb_path.exists() and not alt_thumb.exists():
+                    is_missing = True
+            if self.chk_videos.isChecked():
+                vid_path = out_dir / "Videos" / f"{v_label}.mp4"
+                alt_vid = out_dir / f"{v_label}.mp4"
+                if not vid_path.exists() and not alt_vid.exists():
+                    is_missing = True
+
+            cand.is_selected = is_missing
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.Checked if is_missing else Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._is_populating_table = False
+        self._update_range_status()
+
+    def _on_select_failed(self):
+        self._is_populating_table = True
+        self.table.blockSignals(True)
+        for row, cand in enumerate(self.candidates):
+            status_item = self.table.item(row, 8)
+            stat = status_item.text() if status_item else ""
+            diag = self.diagnostics_dict.get(cand.video_id, {})
+            is_failed = ("Fail" in stat) or ("Error" in stat) or (diag.get("status") == "Failed")
+            cand.is_selected = is_failed
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.Checked if is_failed else Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._is_populating_table = False
+        self._update_range_status()
+
+    def _on_select_incomplete(self):
+        out_dir = Path(self.txt_out_dir.text())
+        self._is_populating_table = True
+        self.table.blockSignals(True)
+        for row, cand in enumerate(self.candidates):
+            v_label = cand.version_label
+            is_incomplete = False
+            # Audio < 10KB
+            mp3_path = out_dir / "Audio" / f"{v_label}.mp3"
+            alt_mp3 = out_dir / f"{v_label}.mp3"
+            target_mp3 = mp3_path if mp3_path.exists() else (alt_mp3 if alt_mp3.exists() else None)
+            if target_mp3 and target_mp3.stat().st_size < 10240:
+                is_incomplete = True
+            # Video < 50KB
+            vid_path = out_dir / "Videos" / f"{v_label}.mp4"
+            alt_vid = out_dir / f"{v_label}.mp4"
+            target_vid = vid_path if vid_path.exists() else (alt_vid if alt_vid.exists() else None)
+            if target_vid and target_vid.stat().st_size < 51200:
+                is_incomplete = True
+            # Script < 10 bytes
+            sc_path = out_dir / "Scripts" / f"{v_label} Script.txt"
+            alt_sc = out_dir / f"{v_label} Script.txt"
+            target_sc = sc_path if sc_path.exists() else (alt_sc if alt_sc.exists() else None)
+            if target_sc and target_sc.stat().st_size < 10:
+                is_incomplete = True
+
+            cand.is_selected = is_incomplete
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.Checked if is_incomplete else Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._is_populating_table = False
+        self._update_range_status()
+
+    def _on_select_skipped(self):
+        skip_spec = self.txt_skip_ranges.text().strip() if hasattr(self, "txt_skip_ranges") else ""
+        self._is_populating_table = True
+        self.table.blockSignals(True)
+        for row, cand in enumerate(self.candidates):
+            status_item = self.table.item(row, 8)
+            stat = status_item.text() if status_item else ""
+            is_skipped = ("Skip" in stat)
+            if skip_spec and not is_skipped:
+                skipped_set = VRangeParser.parse(skip_spec, max_limit=len(self.candidates))
+                if cand.version_num in skipped_set:
+                    is_skipped = True
+            cand.is_selected = is_skipped
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(Qt.Checked if is_skipped else Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._is_populating_table = False
+        self._update_range_status()
+
+    # ==================== TABLE INTERACTIVE FILTERS ====================
+
+    def _apply_table_filters(self):
+        kw = self.txt_filter_keyword.text().strip().lower() if hasattr(self, "txt_filter_keyword") else ""
+        min_v = self.spin_filter_min_views.value() if hasattr(self, "spin_filter_min_views") else 0
+        min_dur = (self.spin_filter_min_dur.value() * 60) if hasattr(self, "spin_filter_min_dur") else 0
+        max_dur = (self.spin_filter_max_dur.value() * 60) if hasattr(self, "spin_filter_max_dur") else 0
+        date_opt = self.combo_filter_date.currentText() if hasattr(self, "combo_filter_date") else "All Dates"
+        type_opt = self.combo_filter_type.currentText() if hasattr(self, "combo_filter_type") else "All Types"
+
+        for row, cand in enumerate(self.candidates):
+            visible = True
+            if kw and kw not in cand.title.lower():
+                visible = False
+            if visible and min_v > 0 and cand.view_count < min_v:
+                visible = False
+            if visible and min_dur > 0 and cand.duration < min_dur:
+                visible = False
+            if visible and max_dur > 0 and cand.duration > max_dur:
+                visible = False
+            if visible:
+                if type_opt == "Shorts Only" and cand.duration > 60:
+                    visible = False
+                elif type_opt == "Videos Only" and (cand.duration <= 60 and cand.duration > 0):
+                    visible = False
+            if visible and date_opt != "All Dates" and cand.upload_date:
+                u_date = cand.upload_date.lower()
+                if date_opt == "Last 30 Days":
+                    if not any(x in u_date for x in ("day", "hour", "minute", "second", "yesterday", "1 week", "2 week", "3 week", "4 week")):
+                        visible = False
+                elif date_opt == "Last 3 Months":
+                    if any(x in u_date for x in ("year", "4 month", "5 month", "6 month", "7 month", "8 month", "9 month", "10 month", "11 month")):
+                        visible = False
+                elif date_opt == "Last Year":
+                    if any(x in u_date for x in ("2 year", "3 year", "4 year", "5 year", "10 year")):
+                        visible = False
+
+            self.table.setRowHidden(row, not visible)
+
+    def _reset_table_filters(self):
+        if hasattr(self, "txt_filter_keyword"):
+            self.txt_filter_keyword.clear()
+        if hasattr(self, "spin_filter_min_views"):
+            self.spin_filter_min_views.setValue(0)
+        if hasattr(self, "spin_filter_min_dur"):
+            self.spin_filter_min_dur.setValue(0)
+        if hasattr(self, "spin_filter_max_dur"):
+            self.spin_filter_max_dur.setValue(0)
+        if hasattr(self, "combo_filter_date"):
+            self.combo_filter_date.setCurrentIndex(0)
+        if hasattr(self, "combo_filter_type"):
+            self.combo_filter_type.setCurrentIndex(0)
+        for row in range(self.table.rowCount()):
+            self.table.setRowHidden(row, False)
+
+    # ==================== MASTER ACTIONS & SMART OPERATIONS ====================
+
+    def _regenerate_titles_clicked(self):
+        selected = self._sync_selected_candidates()
+        if not selected:
+            selected = self.candidates
+        if not selected:
+            QMessageBox.warning(self, "No Videos", "No videos available to generate Titles.txt.")
+            return
+        out_dir = Path(self.txt_out_dir.text())
+        out_dir.mkdir(parents=True, exist_ok=True)
+        titles_path = out_dir / "Titles.txt"
+        try:
+            channel_name = getattr(self, "current_channel_name", "") or getattr(self.fetcher, "channel_name", "")
+            channel_url = self.txt_url.text().strip() or getattr(self.fetcher, "channel_url", "")
+            saved_file = ZipPackager.export_single_titles_file(
+                selected, titles_path, channel_name=channel_name, channel_url=channel_url
+            )
+            QMessageBox.information(
+                self,
+                "Titles.txt Regenerated",
+                f"Successfully regenerated Titles.txt with {len(selected)} entries at:\n{saved_file}",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to regenerate Titles.txt: {e}")
+
+    def _smart_download_clicked(self):
+        """
+        Master Smart Download:
+        Automatically orchestrates:
+        1. Fetch channel if needed
+        2. Apply view count filter & popularity sort
+        3. Scan existing disk files & skip completed files
+        4. Download all selected missing data in parallel
+        5. Live save in real-time
+        6. Display comprehensive statistics report
+        """
+        if not self.candidates:
+            url = self.txt_url.text().strip()
+            if not url:
+                QMessageBox.warning(self, "Missing URL", "Please enter a YouTube URL to run Smart Download.")
+                return
+            self._fetch_videos_clicked()
+            return
+
+        if hasattr(self, "chk_mode_missing_only"):
+            self.chk_mode_missing_only.setChecked(True)
+        if hasattr(self, "chk_mode_force_overwrite"):
+            self.chk_mode_force_overwrite.setChecked(False)
+
+        self._download_selected_items_clicked()
+
+    def _sync_channel_clicked(self):
+        """
+        Sync Channel:
+        Compares local folder with channel videos and downloads only new/missing videos.
+        """
+        if not self.candidates:
+            self._fetch_videos_clicked()
+            return
+        self._on_select_missing()
+        selected = [c for c in self.candidates if c.is_selected]
+        if not selected:
+            QMessageBox.information(self, "Channel In Sync", "All videos in this channel are already fully downloaded on disk!")
+            return
+        self._download_selected_items_clicked()
 
     # ==================== TABLE POPULATION ====================
 
@@ -1719,6 +2299,9 @@ class ChannelView(QWidget):
             return
 
         # Filter candidate lists per asset type
+        thumb_v_spec = self.txt_thumb_v_range.text().strip() if hasattr(self, "txt_thumb_v_range") else ""
+        video_v_spec = self.txt_video_v_range.text().strip() if hasattr(self, "txt_video_v_range") else ""
+
         script_candidates = (
             VRangeParser.filter_candidates(active_selected, include_spec=script_v_spec)
             if (want_scripts and script_v_spec)
@@ -1727,22 +2310,37 @@ class ChannelView(QWidget):
 
         audio_candidates = (
             VRangeParser.filter_candidates(active_selected, include_spec=audio_v_spec)
-            if ((want_mp3s or want_videos) and audio_v_spec)
-            else (list(active_selected) if (want_mp3s or want_videos) else [])
+            if (want_mp3s and audio_v_spec)
+            else (list(active_selected) if want_mp3s else [])
         )
 
-        thumb_count = self.spin_thumb_count.value() if hasattr(self, "spin_thumb_count") else len(active_selected)
-        thumb_max = min(thumb_count, len(active_selected))
-        thumb_candidates = active_selected[:thumb_max] if want_thumbnails else []
+        video_candidates = (
+            VRangeParser.filter_candidates(active_selected, include_spec=video_v_spec)
+            if (want_videos and video_v_spec)
+            else (list(active_selected) if want_videos else [])
+        )
+
+        thumb_candidates = (
+            VRangeParser.filter_candidates(active_selected, include_spec=thumb_v_spec)
+            if (want_thumbnails and thumb_v_spec)
+            else (list(active_selected) if want_thumbnails else [])
+        )
+        if want_thumbnails and not thumb_v_spec:
+            thumb_count = self.spin_thumb_count.value() if hasattr(self, "spin_thumb_count") else len(thumb_candidates)
+            thumb_candidates = thumb_candidates[: min(thumb_count, len(thumb_candidates))]
+        else:
+            thumb_count = len(thumb_candidates)
 
         if want_titles:
             if want_linked_titles:
-                linked_ids = {c.video_id for c in script_candidates} | {c.video_id for c in audio_candidates}
+                linked_ids = {c.video_id for c in script_candidates} | {c.video_id for c in audio_candidates} | {c.video_id for c in video_candidates}
                 title_candidates = [c for c in active_selected if c.video_id in linked_ids]
             else:
                 title_candidates = list(active_selected)
         else:
             title_candidates = []
+
+        combined_media_candidates = list({c.video_id: c for c in (audio_candidates + video_candidates)}.values())
 
         if not any([
             title_candidates,
@@ -1750,6 +2348,7 @@ class ChannelView(QWidget):
             want_channel_assets,
             script_candidates,
             audio_candidates,
+            video_candidates,
         ]):
             QMessageBox.warning(
                 self,
@@ -1785,6 +2384,9 @@ class ChannelView(QWidget):
         for cand in active_selected:
             self._update_candidate_status(cand.video_id, "Queued")
 
+        force_overwrite = bool(self.chk_mode_force_overwrite.isChecked()) if hasattr(self, "chk_mode_force_overwrite") else False
+        missing_only = bool(self.chk_mode_missing_only.isChecked()) if hasattr(self, "chk_mode_missing_only") else True
+
         self._phased_pipeline_state = {
             "base_dir": base_dir,
             "selected": active_selected,
@@ -1796,14 +2398,17 @@ class ChannelView(QWidget):
             "want_channel_assets": want_channel_assets,
             "want_scripts": bool(want_scripts and script_candidates),
             "want_mp3s": bool(want_mp3s and audio_candidates),
-            "want_videos": bool(want_videos and audio_candidates),
+            "want_videos": bool(want_videos and video_candidates),
             "title_candidates": title_candidates,
             "thumb_candidates": thumb_candidates,
             "script_candidates": script_candidates,
-            "audio_candidates": audio_candidates,
+            "audio_candidates": combined_media_candidates,
+            "video_candidates": video_candidates,
             "thumb_count": thumb_count,
             "script_concurrency": script_concurrency,
             "audio_concurrency": audio_concurrency,
+            "force_overwrite": force_overwrite,
+            "missing_only": missing_only,
             # Phase done flags
             "titles_done": not bool(want_titles and title_candidates),
             "thumbs_done": not bool(want_thumbnails and thumb_candidates),

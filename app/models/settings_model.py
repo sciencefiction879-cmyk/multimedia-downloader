@@ -64,6 +64,36 @@ class Settings:
     preferred_player_client: str = "auto"
 
     log_level: str = DEFAULT_LOG_LEVEL
+    custom_presets: dict = None
+
+    def __post_init__(self):
+        if self.custom_presets is None:
+            self.custom_presets = {
+                "Preset 1 (Scripts + Audio)": {
+                    "want_titles": True,
+                    "want_thumbnails": False,
+                    "want_channel_assets": False,
+                    "want_scripts": True,
+                    "want_mp3s": True,
+                    "want_videos": False,
+                },
+                "Preset 2 (Videos + Thumbnails)": {
+                    "want_titles": True,
+                    "want_thumbnails": True,
+                    "want_channel_assets": False,
+                    "want_scripts": False,
+                    "want_mp3s": False,
+                    "want_videos": True,
+                },
+                "Preset 3 (Complete Package)": {
+                    "want_titles": True,
+                    "want_thumbnails": True,
+                    "want_channel_assets": True,
+                    "want_scripts": True,
+                    "want_mp3s": True,
+                    "want_videos": True,
+                },
+            }
 
 
     @classmethod

@@ -78,6 +78,7 @@ class DownloadsView(QWidget):
         self.table.retry_requested.connect(self.queue_manager.retry_item)
         self.table.resume_requested.connect(self.queue_manager.resume_item)
         self.table.remove_requested.connect(self.queue_manager.remove_item)
+        self.table.move_to_front_requested.connect(self.queue_manager.move_to_front)
         layout.addWidget(self.table)
 
     def _load_initial_items(self):

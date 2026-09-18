@@ -187,6 +187,18 @@ class QueueManager(QObject):
             self.item_updated.emit(it)
         self.save_queue()
 
+    def move_to_front(self, item_id: str):
+        """Moves a queued item to the front of the queue to be processed with top priority."""
+        idx = next((i for i, it in enumerate(self.items) if it.id == item_id), -1)
+        if idx > 0:
+            item = self.items.pop(idx)
+            self.items.insert(0, item)
+            for new_idx, it in enumerate(self.items, start=1):
+                it.number = new_idx
+                self.item_updated.emit(it)
+            self.save_queue()
+            self._process_queue()
+
     def _process_queue(self):
         if not self.is_running:
             return

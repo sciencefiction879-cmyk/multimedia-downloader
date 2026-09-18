@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 
+import csv
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -22,6 +23,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QScrollArea,
     QWidget,
+    QFileDialog,
+    QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
@@ -186,6 +189,16 @@ class DownloadStatisticsDialog(QDialog):
         btn_copy.clicked.connect(self._copy_diagnostic_report)
         btn_bar.addWidget(btn_copy)
 
+        self.btn_export_csv = QPushButton("📄 Export CSV")
+        self.btn_export_csv.setToolTip("Export complete statistics and diagnostic rows as a CSV spreadsheet")
+        self.btn_export_csv.clicked.connect(self._export_csv_report)
+        btn_bar.addWidget(self.btn_export_csv)
+
+        self.btn_export_txt = QPushButton("📝 Export TXT")
+        self.btn_export_txt.setToolTip("Export formatted text report directly to a file")
+        self.btn_export_txt.clicked.connect(self._export_txt_report)
+        btn_bar.addWidget(self.btn_export_txt)
+
         btn_bar.addStretch()
 
         if fail_count > 0:
@@ -231,7 +244,7 @@ class DownloadStatisticsDialog(QDialog):
         else:
             subprocess.run(["xdg-open", str(self.output_dir)])
 
-    def _copy_diagnostic_report(self):
+    def get_report_text(self) -> str:
         report = [
             "==================================================",
             f" MultiDownloader v{APP_VERSION} - Download Statistics Report",
@@ -259,9 +272,74 @@ class DownloadStatisticsDialog(QDialog):
                 )
         else:
             report.append("All items downloaded cleanly with 0 failures.")
+        return "\n".join(report)
 
-        report_str = "\n".join(report)
+    def _copy_diagnostic_report(self):
+        report_str = self.get_report_text()
         QApplication.clipboard().setText(report_str)
+
+    def export_csv(self, file_path: Path | str) -> bool:
+        """Export statistics and itemized diagnostic data to CSV."""
+        try:
+            p = Path(file_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Type", "Key / V-Number", "Value / Title", "Category", "Status", "Reason / Diagnostics"])
+                # Summary rows
+                writer.writerow(["Summary", "Total Videos", self.stats.get("total_videos", 0), "All", "Info", ""])
+                writer.writerow(["Summary", "Succeeded", self.stats.get("total_succeeded", 0), "All", "Success", ""])
+                writer.writerow(["Summary", "Skipped", self.stats.get("total_skipped", 0), "All", "Skipped", ""])
+                writer.writerow(["Summary", "Failed", len(self.failed_items), "All", "Failed", ""])
+                for cat in ["titles", "scripts", "thumbnails", "audio", "video", "assets"]:
+                    k = f"{cat}_status"
+                    writer.writerow(["Category", cat.title(), self.stats.get(k, "N/A"), cat.title(), "Status", ""])
+                # Item rows
+                if self.failed_items:
+                    for item in self.failed_items:
+                        writer.writerow([
+                            "Failed Item",
+                            item.get("version_label", ""),
+                            item.get("title", ""),
+                            item.get("category", ""),
+                            "Failed",
+                            item.get("reason", "")
+                        ])
+                else:
+                    writer.writerow(["Result", "All Items", "100% Downloaded Successfully", "All", "Clean", "No errors"])
+            return True
+        except Exception:
+            return False
+
+    def export_txt(self, file_path: Path | str) -> bool:
+        """Export formatted text report directly to a file on disk."""
+        try:
+            p = Path(file_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            text_content = self.get_report_text()
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text_content)
+            return True
+        except Exception:
+            return False
+
+    def _export_csv_report(self):
+        default_name = str(self.output_dir / "download_statistics.csv") if self.output_dir else "download_statistics.csv"
+        path, _ = QFileDialog.getSaveFileName(self, "Export CSV Report", default_name, "CSV Files (*.csv)")
+        if path:
+            if self.export_csv(path):
+                QMessageBox.information(self, "Export Successful", f"CSV report exported to:\n{path}")
+            else:
+                QMessageBox.warning(self, "Export Failed", f"Could not write CSV report to:\n{path}")
+
+    def _export_txt_report(self):
+        default_name = str(self.output_dir / "download_statistics.txt") if self.output_dir else "download_statistics.txt"
+        path, _ = QFileDialog.getSaveFileName(self, "Export TXT Report", default_name, "Text Files (*.txt)")
+        if path:
+            if self.export_txt(path):
+                QMessageBox.information(self, "Export Successful", f"TXT report exported to:\n{path}")
+            else:
+                QMessageBox.warning(self, "Export Failed", f"Could not write TXT report to:\n{path}")
 
     def _on_retry_clicked(self):
         self.retry_requested.emit(self.failed_items)

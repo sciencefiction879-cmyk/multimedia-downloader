@@ -77,6 +77,8 @@ class ZipPackager:
         etc.
         """
         output_file = Path(output_file)
+        if output_file.is_dir():
+            output_file = output_file / "Titles.txt"
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
         if not channel_name and candidates:
