@@ -554,6 +554,7 @@ class ChannelView(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -576,41 +577,47 @@ class ChannelView(QWidget):
         # 1. Fetch Options Card
         # -------------------------------------------------------------
         box_fetch = QGroupBox("1. Channel / Playlist / Video Link")
-        fetch_layout = QGridLayout(box_fetch)
-        fetch_layout.setSpacing(10)
+        fetch_vbox = QVBoxLayout(box_fetch)
+        fetch_vbox.setSpacing(10)
 
-        fetch_layout.addWidget(QLabel("YouTube URL:"), 0, 0)
+        # Row 0: URL input + Paste + Channel Videos Count
+        url_row = QHBoxLayout()
+        url_row.setSpacing(8)
+        lbl_url = QLabel("YouTube URL:")
+        lbl_url.setFixedWidth(85)
         self.txt_url = QLineEdit()
         self.txt_url.setPlaceholderText("Paste Channel link (@Channel/videos), Playlist, or Video URL here...")
-        fetch_layout.addWidget(self.txt_url, 0, 1, 1, 2)
-
-        self.lbl_total_available_videos = QLabel("Channel Videos: —")
-        self.lbl_total_available_videos.setStyleSheet("color: #007aff; font-weight: 700; font-size: 12px;")
-        fetch_layout.addWidget(self.lbl_total_available_videos, 0, 3)
-
+        
         btn_paste = QPushButton("📋 Paste")
         btn_paste.clicked.connect(lambda: self.txt_url.setText(QApplication.clipboard().text().strip()))
-        fetch_layout.addWidget(btn_paste, 0, 4)
 
-        fetch_layout.addWidget(QLabel("Order:"), 1, 0)
+        self.lbl_total_available_videos = QLabel("Channel Videos: —")
+        self.lbl_total_available_videos.setStyleSheet("color: #007aff; font-weight: 700; font-size: 12px; margin-left: 4px;")
+
+        url_row.addWidget(lbl_url)
+        url_row.addWidget(self.txt_url, 1)
+        url_row.addWidget(btn_paste)
+        url_row.addWidget(self.lbl_total_available_videos)
+        fetch_vbox.addLayout(url_row)
+
+        # Row 1: Order + Count + Action Buttons
+        ctrl_row = QHBoxLayout()
+        ctrl_row.setSpacing(8)
+
+        lbl_ord = QLabel("Order:")
+        lbl_ord.setFixedWidth(85)
         self.combo_order = QComboBox()
         self.combo_order.addItems(CHANNEL_ORDER_OPTIONS)
         self.combo_order.setCurrentText(ORDER_LATEST_TO_OLDEST)
         self.combo_order.currentTextChanged.connect(self._on_order_changed)
-        fetch_layout.addWidget(self.combo_order, 1, 1)
 
-        fetch_layout.addWidget(QLabel("Videos to Fetch:"), 1, 2)
+        lbl_cnt = QLabel("Videos to Fetch:")
         self.combo_count = QComboBox()
         self.combo_count.setEditable(True)
         self.combo_count.setToolTip("Enter count (e.g. 50) or exact custom range (e.g. 1-10, 1-25, 20-30, 47-52, All)")
         for count in CHANNEL_FETCH_RANGES:
             self.combo_count.addItem(str(count), count)
         self.combo_count.setCurrentText(str(DEFAULT_CHANNEL_FETCH_COUNT))
-        fetch_layout.addWidget(self.combo_count, 1, 3)
-
-        # Action button row: Fetch, Force Fetch, Stop, Clear
-        fetch_btn_row = QHBoxLayout()
-        fetch_btn_row.setSpacing(6)
 
         self.btn_fetch = QPushButton("🔍 Fetch Videos")
         self.btn_fetch.setObjectName("primaryBtn")
@@ -628,69 +635,77 @@ class ChannelView(QWidget):
         self.btn_clear_all = QPushButton("✕ Clear")
         self.btn_clear_all.clicked.connect(self._clear_all_clicked)
 
-        fetch_btn_row.addWidget(self.btn_fetch)
-        fetch_btn_row.addWidget(self.btn_force_fetch)
-        fetch_btn_row.addWidget(self.btn_stop_fetch)
-        fetch_btn_row.addWidget(self.btn_clear_all)
-        fetch_layout.addLayout(fetch_btn_row, 1, 4)
+        ctrl_row.addWidget(lbl_ord)
+        ctrl_row.addWidget(self.combo_order)
+        ctrl_row.addWidget(lbl_cnt)
+        ctrl_row.addWidget(self.combo_count)
+        ctrl_row.addStretch()
+        ctrl_row.addWidget(self.btn_fetch)
+        ctrl_row.addWidget(self.btn_force_fetch)
+        ctrl_row.addWidget(self.btn_stop_fetch)
+        ctrl_row.addWidget(self.btn_clear_all)
+        fetch_vbox.addLayout(ctrl_row)
 
-        # Row 2: View Count Filter (Works with Popularity and Chronological Sorting)
-        fetch_layout.addWidget(QLabel("👁 View Count Filter:"), 2, 0)
-        
-        view_filter_row = QHBoxLayout()
-        view_filter_row.setSpacing(6)
-        
+        # Row 2: View Count Filter Bar
+        vf_frame = QFrame()
+        vf_frame.setStyleSheet("background-color: rgba(0, 122, 255, 0.04); border: 1px solid rgba(0, 122, 255, 0.2); border-radius: 6px; padding: 4px;")
+        vf_layout = QHBoxLayout(vf_frame)
+        vf_layout.setContentsMargins(8, 4, 8, 4)
+        vf_layout.setSpacing(6)
+
+        lbl_vf = QLabel("👁 <b>View Filter:</b>")
+        lbl_vf.setStyleSheet("color: #007aff;")
+
         self.txt_min_views = QLineEdit()
-        self.txt_min_views.setPlaceholderText("Min Views (e.g. 100K, 500,000)")
+        self.txt_min_views.setPlaceholderText("Min (e.g. 100K)")
         self.txt_min_views.setToolTip("Filter videos with at least this many views (e.g. 100K, 500,000, 1M). Applied before V-numbering.")
         self.txt_min_views.returnPressed.connect(self._apply_view_filter_and_sort)
-        
+        self.txt_min_views.setMaximumWidth(120)
+
         lbl_to = QLabel("to")
         lbl_to.setStyleSheet("color: #8e8e93; font-weight: 600;")
-        
+
         self.txt_max_views = QLineEdit()
-        self.txt_max_views.setPlaceholderText("Max Views (e.g. 1M, 2,000,000)")
+        self.txt_max_views.setPlaceholderText("Max (e.g. 2M)")
         self.txt_max_views.setToolTip("Filter videos with at most this many views (e.g. 1M, 2,000,000). Applied before V-numbering.")
         self.txt_max_views.returnPressed.connect(self._apply_view_filter_and_sort)
-        
-        view_filter_row.addWidget(self.txt_min_views, 1)
-        view_filter_row.addWidget(lbl_to)
-        view_filter_row.addWidget(self.txt_max_views, 1)
-        fetch_layout.addLayout(view_filter_row, 2, 1, 1, 2)
-        
-        self.lbl_unavailable_count = QLabel("Unavailable/Private: 0")
-        self.lbl_unavailable_count.setStyleSheet("color: #8e8e93; font-size: 11px;")
-        fetch_layout.addWidget(self.lbl_unavailable_count, 2, 3)
-        
-        # View count quick presets & Apply
-        view_btn_row = QHBoxLayout()
-        view_btn_row.setSpacing(4)
-        
+        self.txt_max_views.setMaximumWidth(120)
+
         btn_v_100k = QPushButton("100K+")
         btn_v_100k.setToolTip("Quick preset: 100,000+ views")
         btn_v_100k.clicked.connect(lambda: self._set_view_filter_preset("100K", ""))
-        
+
         btn_v_500k = QPushButton("500K-2M")
         btn_v_500k.setToolTip("Quick preset: 500,000 to 2,000,000 views")
         btn_v_500k.clicked.connect(lambda: self._set_view_filter_preset("500K", "2M"))
-        
+
         btn_v_less100k = QPushButton("< 100K")
         btn_v_less100k.setToolTip("Quick preset: less than 100,000 views")
         btn_v_less100k.clicked.connect(lambda: self._set_view_filter_preset("", "100K"))
-        
+
         btn_v_apply = QPushButton("⚡ Apply Filter")
-        btn_v_apply.setStyleSheet("background-color: #007aff; color: #ffffff; font-weight: 700;")
+        btn_v_apply.setStyleSheet("background-color: #007aff; color: #ffffff; font-weight: 700; padding: 4px 10px;")
         btn_v_apply.clicked.connect(self._apply_view_filter_and_sort)
-        
+
         btn_v_clear = QPushButton("✕ Clear")
         btn_v_clear.clicked.connect(lambda: self._set_view_filter_preset("", ""))
-        
-        view_btn_row.addWidget(btn_v_100k)
-        view_btn_row.addWidget(btn_v_500k)
-        view_btn_row.addWidget(btn_v_less100k)
-        view_btn_row.addWidget(btn_v_apply)
-        view_btn_row.addWidget(btn_v_clear)
-        fetch_layout.addLayout(view_btn_row, 2, 4)
+
+        self.lbl_unavailable_count = QLabel("Unavailable/Private: 0")
+        self.lbl_unavailable_count.setStyleSheet("color: #8e8e93; font-size: 11px; margin-left: 8px;")
+
+        vf_layout.addWidget(lbl_vf)
+        vf_layout.addWidget(self.txt_min_views)
+        vf_layout.addWidget(lbl_to)
+        vf_layout.addWidget(self.txt_max_views)
+        vf_layout.addWidget(btn_v_100k)
+        vf_layout.addWidget(btn_v_500k)
+        vf_layout.addWidget(btn_v_less100k)
+        vf_layout.addWidget(btn_v_apply)
+        vf_layout.addWidget(btn_v_clear)
+        vf_layout.addStretch()
+        vf_layout.addWidget(self.lbl_unavailable_count)
+
+        fetch_vbox.addWidget(vf_frame)
 
         # Auto-fetch debounced timer
         self.auto_fetch_timer = QTimer(self)
@@ -747,19 +762,20 @@ class ChannelView(QWidget):
 
         # 6 Clean Selection Checkboxes organized in grid with custom controls
         grid_sel = QGridLayout()
-        grid_sel.setSpacing(10)
+        grid_sel.setHorizontalSpacing(14)
+        grid_sel.setVerticalSpacing(8)
 
         # 1. Video Titles + Linked option
         w_title = QWidget()
         l_title = QVBoxLayout(w_title)
         l_title.setContentsMargins(0, 0, 0, 0)
-        l_title.setSpacing(2)
-        self.chk_titles = QCheckBox("1. Video Titles (Titles.txt in folder)")
+        l_title.setSpacing(3)
+        self.chk_titles = QCheckBox("1. Video Titles (Titles.txt)")
         self.chk_titles.setChecked(True)
         self.chk_titles.setToolTip("Creates single TXT file named Titles.txt containing V1 — Title, V2 — Title...")
         self.chk_titles_linked = QCheckBox("🔗 Only active script/audio videos in Titles.txt")
         self.chk_titles_linked.setChecked(False)
-        self.chk_titles_linked.setStyleSheet("color: #8e8e93; font-size: 11px; margin-left: 20px;")
+        self.chk_titles_linked.setStyleSheet("color: #8e8e93; font-size: 11px; margin-left: 18px;")
         self.chk_titles_linked.setToolTip("When checked, Titles.txt only includes videos being actively downloaded in Scripts or Audio")
         l_title.addWidget(self.chk_titles)
         l_title.addWidget(self.chk_titles_linked)
@@ -783,22 +799,30 @@ class ChannelView(QWidget):
         self.spin_thumb_count.setToolTip("Custom select total number of video thumbnails to download (e.g. 10, 25, 50, all)")
         self.spin_thumb_count.valueChanged.connect(self._on_thumb_count_changed)
         l_thumb_top.addWidget(self.chk_thumbnails)
+        l_thumb_top.addStretch()
         l_thumb_top.addWidget(self.lbl_thumb_count)
         l_thumb_top.addWidget(self.spin_thumb_count)
-        l_thumb_top.addStretch()
         l_thumb.addLayout(l_thumb_top)
 
         self.txt_thumb_v_range = QLineEdit()
-        self.txt_thumb_v_range.setPlaceholderText("Custom Thumbnail Range (e.g. V1-V20, empty = all)")
+        self.txt_thumb_v_range.setPlaceholderText("Thumbnail Range (e.g. V1-V20, empty = all)")
         self.txt_thumb_v_range.setStyleSheet("font-size: 11px;")
         l_thumb.addWidget(self.txt_thumb_v_range)
         grid_sel.addWidget(w_thumb, 0, 1)
 
         # 3. Channel Assets
+        w_asset = QWidget()
+        l_asset = QVBoxLayout(w_asset)
+        l_asset.setContentsMargins(0, 0, 0, 0)
+        l_asset.setSpacing(3)
         self.chk_channel_assets = QCheckBox("3. Channel Assets (Banner & Logo)")
         self.chk_channel_assets.setChecked(True)
         self.chk_channel_assets.setToolTip("Competitor channel banner and avatar/logo images saved into Channel Assets/")
-        grid_sel.addWidget(self.chk_channel_assets, 0, 2)
+        lbl_asset_sub = QLabel("Avatar, banner, & metadata")
+        lbl_asset_sub.setStyleSheet("color: #8e8e93; font-size: 11px; margin-left: 18px;")
+        l_asset.addWidget(self.chk_channel_assets)
+        l_asset.addWidget(lbl_asset_sub)
+        grid_sel.addWidget(w_asset, 0, 2)
 
         # 4. Scripts with custom parallel concurrency and custom V-range
         w_script = QWidget()
@@ -820,13 +844,13 @@ class ChannelView(QWidget):
         self.spin_script_concurrency.setToolTip("Custom select how many scripts download in parallel (up to 500)")
         self.spin_script_concurrency.valueChanged.connect(self._on_script_concurrency_changed)
         l_script_top.addWidget(self.chk_scripts)
+        l_script_top.addStretch()
         l_script_top.addWidget(self.lbl_script_conc)
         l_script_top.addWidget(self.spin_script_concurrency)
-        l_script_top.addStretch()
         l_script.addLayout(l_script_top)
 
         self.txt_script_v_range = QLineEdit()
-        self.txt_script_v_range.setPlaceholderText("Custom Script Range (e.g. V11-V30, empty = all)")
+        self.txt_script_v_range.setPlaceholderText("Script Range (e.g. V11-V30, empty = all)")
         self.txt_script_v_range.setStyleSheet("font-size: 11px;")
         l_script.addWidget(self.txt_script_v_range)
         grid_sel.addWidget(w_script, 1, 0)
@@ -839,7 +863,7 @@ class ChannelView(QWidget):
 
         l_audio_top = QHBoxLayout()
         l_audio_top.setSpacing(6)
-        self.chk_mp3s = QCheckBox("5. Audio (Audio/)")
+        self.chk_mp3s = QCheckBox("5. Audio (MP3)")
         self.chk_mp3s.setChecked(True)
         self.chk_mp3s.setToolTip("Parallel MP3 audio downloads named V1.mp3, V2.mp3... (concurrency 1-500)")
         self.lbl_audio_conc = QLabel("⚡ Parallel:")
@@ -851,13 +875,13 @@ class ChannelView(QWidget):
         self.spin_audio_concurrency.setToolTip("Custom select how many audio files download in parallel (up to 500)")
         self.spin_audio_concurrency.valueChanged.connect(self._on_audio_concurrency_changed)
         l_audio_top.addWidget(self.chk_mp3s)
+        l_audio_top.addStretch()
         l_audio_top.addWidget(self.lbl_audio_conc)
         l_audio_top.addWidget(self.spin_audio_concurrency)
-        l_audio_top.addStretch()
         l_audio.addLayout(l_audio_top)
 
         self.txt_audio_v_range = QLineEdit()
-        self.txt_audio_v_range.setPlaceholderText("Custom Audio Range (e.g. V1-V19 + V31+, empty = all)")
+        self.txt_audio_v_range.setPlaceholderText("Audio Range (e.g. V1-V19 + V31+, empty = all)")
         self.txt_audio_v_range.setStyleSheet("font-size: 11px;")
         l_audio.addWidget(self.txt_audio_v_range)
         grid_sel.addWidget(w_audio, 1, 1)
@@ -867,72 +891,72 @@ class ChannelView(QWidget):
         l_video = QVBoxLayout(w_video)
         l_video.setContentsMargins(0, 0, 0, 0)
         l_video.setSpacing(3)
-        self.chk_videos = QCheckBox("6. Videos (Videos/ folder: V1.mp4...)")
+        self.chk_videos = QCheckBox("6. Videos (MP4)")
         self.chk_videos.setChecked(False)
         self.chk_videos.setToolTip("Downloads actual video files (MP4) named V1.mp4, V2.mp4... at selected quality")
         l_video.addWidget(self.chk_videos)
 
         self.txt_video_v_range = QLineEdit()
-        self.txt_video_v_range.setPlaceholderText("Custom Video Range (e.g. V1-V10, empty = all)")
+        self.txt_video_v_range.setPlaceholderText("Video Range (e.g. V1-V10, empty = all)")
         self.txt_video_v_range.setStyleSheet("font-size: 11px;")
         l_video.addWidget(self.txt_video_v_range)
         grid_sel.addWidget(w_video, 1, 2)
 
         sel_layout.addLayout(grid_sel)
 
-        # Master Operational Modes (Missing Only vs Force Overwrite)
-        modes_row = QHBoxLayout()
-        modes_row.setSpacing(16)
-        self.chk_mode_missing_only = QCheckBox("⚡ Download Missing Only (Skip Completed)")
+        # Preset Buttons and Operational Modes Row
+        preset_modes_row = QHBoxLayout()
+        preset_modes_row.setSpacing(8)
+
+        lbl_presets = QLabel("Presets:")
+        lbl_presets.setStyleSheet("color: #9d9da8; font-weight: 600; font-size: 11px;")
+        preset_modes_row.addWidget(lbl_presets)
+
+        btn_preset_all = QPushButton("All")
+        btn_preset_all.clicked.connect(self._preset_select_all_data)
+        preset_modes_row.addWidget(btn_preset_all)
+
+        btn_preset_none = QPushButton("None")
+        btn_preset_none.clicked.connect(self._preset_deselect_all_data)
+        preset_modes_row.addWidget(btn_preset_none)
+
+        btn_preset_scripts = QPushButton("Scripts + Titles")
+        btn_preset_scripts.clicked.connect(self._preset_scripts_titles_data)
+        preset_modes_row.addWidget(btn_preset_scripts)
+
+        btn_preset_media = QPushButton("Media Only")
+        btn_preset_media.clicked.connect(self._preset_media_only_data)
+        preset_modes_row.addWidget(btn_preset_media)
+
+        btn_preset_core = QPushButton("Core Package (Default)")
+        btn_preset_core.clicked.connect(self._preset_core_package_data)
+        preset_modes_row.addWidget(btn_preset_core)
+
+        preset_modes_row.addStretch()
+
+        self.chk_mode_missing_only = QCheckBox("⚡ Download Missing Only")
         self.chk_mode_missing_only.setChecked(True)
         self.chk_mode_missing_only.setToolTip("Strictly downloads missing files and skips all valid completed files on disk")
 
-        self.chk_mode_force_overwrite = QCheckBox("🔄 Force Redownload / Overwrite All")
+        self.chk_mode_force_overwrite = QCheckBox("🔄 Force Redownload All")
         self.chk_mode_force_overwrite.setChecked(False)
         self.chk_mode_force_overwrite.setToolTip("Forces redownloading and overwriting of all selected files even if present")
 
         self.chk_mode_missing_only.toggled.connect(lambda checked: self.chk_mode_force_overwrite.setChecked(False) if checked else None)
         self.chk_mode_force_overwrite.toggled.connect(lambda checked: self.chk_mode_missing_only.setChecked(False) if checked else None)
 
-        modes_row.addWidget(self.chk_mode_missing_only)
-        modes_row.addWidget(self.chk_mode_force_overwrite)
-        modes_row.addStretch()
-        sel_layout.addLayout(modes_row)
+        preset_modes_row.addWidget(self.chk_mode_missing_only)
+        preset_modes_row.addWidget(self.chk_mode_force_overwrite)
+        sel_layout.addLayout(preset_modes_row)
 
-        # Selection presets and Launch / Resume Buttons
-        bottom_sel_row = QHBoxLayout()
-        bottom_sel_row.setSpacing(8)
-
-        lbl_presets = QLabel("Presets:")
-        lbl_presets.setStyleSheet("color: #9d9da8; font-weight: 600;")
-        bottom_sel_row.addWidget(lbl_presets)
-
-        btn_preset_all = QPushButton("Select All")
-        btn_preset_all.clicked.connect(self._preset_select_all_data)
-        bottom_sel_row.addWidget(btn_preset_all)
-
-        btn_preset_none = QPushButton("Deselect All")
-        btn_preset_none.clicked.connect(self._preset_deselect_all_data)
-        bottom_sel_row.addWidget(btn_preset_none)
-
-        btn_preset_scripts = QPushButton("Scripts + Titles")
-        btn_preset_scripts.clicked.connect(self._preset_scripts_titles_data)
-        bottom_sel_row.addWidget(btn_preset_scripts)
-
-        btn_preset_media = QPushButton("Media Only")
-        btn_preset_media.clicked.connect(self._preset_media_only_data)
-        bottom_sel_row.addWidget(btn_preset_media)
-
-        btn_preset_core = QPushButton("Core Package (Default)")
-        btn_preset_core.clicked.connect(self._preset_core_package_data)
-        bottom_sel_row.addWidget(btn_preset_core)
-
-        bottom_sel_row.addStretch()
+        # Primary Action Command Center Row
+        action_cmd_row = QHBoxLayout()
+        action_cmd_row.setSpacing(8)
 
         self.btn_regenerate_titles = QPushButton("📝 Regenerate Titles.txt")
         self.btn_regenerate_titles.setToolTip("Re-exports Titles.txt for selected candidates directly into folder without downloading media")
         self.btn_regenerate_titles.clicked.connect(self._regenerate_titles_clicked)
-        bottom_sel_row.addWidget(self.btn_regenerate_titles)
+        action_cmd_row.addWidget(self.btn_regenerate_titles)
 
         self.btn_sync_channel = QPushButton("🔄 SYNC CHANNEL")
         self.btn_sync_channel.setStyleSheet(
@@ -940,7 +964,7 @@ class ChannelView(QWidget):
         )
         self.btn_sync_channel.setToolTip("Compares local folder with channel, selects only un-downloaded items, and downloads them")
         self.btn_sync_channel.clicked.connect(self._sync_channel_clicked)
-        bottom_sel_row.addWidget(self.btn_sync_channel)
+        action_cmd_row.addWidget(self.btn_sync_channel)
 
         self.btn_resume_download = QPushButton("⏯ RESUME")
         self.btn_resume_download.setStyleSheet(
@@ -948,7 +972,7 @@ class ChannelView(QWidget):
         )
         self.btn_resume_download.setToolTip("Resumes download; automatically checks disk and skips already completed files instantly")
         self.btn_resume_download.clicked.connect(self._resume_download_clicked)
-        bottom_sel_row.addWidget(self.btn_resume_download)
+        action_cmd_row.addWidget(self.btn_resume_download)
 
         self.btn_smart_download = QPushButton("🌟 SMART DOWNLOAD")
         self.btn_smart_download.setStyleSheet(
@@ -956,7 +980,7 @@ class ChannelView(QWidget):
         )
         self.btn_smart_download.setToolTip("Master 1-click execution: sort, filter by views, scan disk, download missing assets in parallel, and show full statistics")
         self.btn_smart_download.clicked.connect(self._smart_download_clicked)
-        bottom_sel_row.addWidget(self.btn_smart_download)
+        action_cmd_row.addWidget(self.btn_smart_download)
 
         self.btn_download_selected = QPushButton("🚀 DOWNLOAD SELECTED")
         self.btn_download_selected.setStyleSheet(
@@ -964,9 +988,9 @@ class ChannelView(QWidget):
         )
         self.btn_download_selected.setToolTip("Execute download pipeline for all checked items on selected videos")
         self.btn_download_selected.clicked.connect(self._download_selected_items_clicked)
-        bottom_sel_row.addWidget(self.btn_download_selected)
+        action_cmd_row.addWidget(self.btn_download_selected)
+        sel_layout.addLayout(action_cmd_row)
 
-        sel_layout.addLayout(bottom_sel_row)
         layout.addWidget(box_selection)
 
         # -------------------------------------------------------------
@@ -1148,27 +1172,27 @@ class ChannelView(QWidget):
         lbl_act.setStyleSheet("color: #8e8e93; font-size: 11px;")
         sel_actions_bar.addWidget(lbl_act)
 
-        self.btn_invert_sel = QPushButton("Invert Selection")
+        self.btn_invert_sel = QPushButton("Invert")
         self.btn_invert_sel.setToolTip("Invert checkbox selection states across all matched videos")
         self.btn_invert_sel.clicked.connect(self._on_invert_selection)
         sel_actions_bar.addWidget(self.btn_invert_sel)
 
-        self.btn_select_missing = QPushButton("Select Missing Only")
+        self.btn_select_missing = QPushButton("Select Missing")
         self.btn_select_missing.setToolTip("Scans save folder and selects only videos with missing files on disk")
         self.btn_select_missing.clicked.connect(self._on_select_missing)
         sel_actions_bar.addWidget(self.btn_select_missing)
 
-        self.btn_select_failed = QPushButton("Select Failed Only")
+        self.btn_select_failed = QPushButton("Select Failed")
         self.btn_select_failed.setToolTip("Selects only videos that previously failed or produced errors")
         self.btn_select_failed.clicked.connect(self._on_select_failed)
         sel_actions_bar.addWidget(self.btn_select_failed)
 
-        self.btn_select_incomplete = QPushButton("Select Incomplete Only")
+        self.btn_select_incomplete = QPushButton("Select Incomplete")
         self.btn_select_incomplete.setToolTip("Selects partial/corrupt files (<10KB audio / <50KB video / empty scripts)")
         self.btn_select_incomplete.clicked.connect(self._on_select_incomplete)
         sel_actions_bar.addWidget(self.btn_select_incomplete)
 
-        self.btn_select_skipped = QPushButton("Select Skipped Only")
+        self.btn_select_skipped = QPushButton("Select Skipped")
         self.btn_select_skipped.setToolTip("Selects candidates matching skip V-ranges or marked as skipped")
         self.btn_select_skipped.clicked.connect(self._on_select_skipped)
         sel_actions_bar.addWidget(self.btn_select_skipped)
@@ -1178,10 +1202,10 @@ class ChannelView(QWidget):
 
         # Interactive Table Filter Bar (Keyword, Min Views, Duration, Date, Type)
         filter_bar = QHBoxLayout()
-        filter_bar.setSpacing(8)
+        filter_bar.setSpacing(6)
 
         self.txt_filter_keyword = QLineEdit()
-        self.txt_filter_keyword.setPlaceholderText("🔍 Filter by title keyword...")
+        self.txt_filter_keyword.setPlaceholderText("🔍 Search by title keyword...")
         self.txt_filter_keyword.setToolTip("Instant real-time search: filters table rows matching keyword")
         self.txt_filter_keyword.textChanged.connect(self._apply_table_filters)
         filter_bar.addWidget(self.txt_filter_keyword, 2)
@@ -1193,33 +1217,38 @@ class ChannelView(QWidget):
         self.spin_filter_min_views.setSpecialValueText("Min Views: Any")
         self.spin_filter_min_views.setToolTip("Filters table rows showing only videos with at least this many views")
         self.spin_filter_min_views.valueChanged.connect(self._apply_table_filters)
-        filter_bar.addWidget(self.spin_filter_min_views, 1)
+        self.spin_filter_min_views.setMaximumWidth(120)
+        filter_bar.addWidget(self.spin_filter_min_views)
 
         self.spin_filter_min_dur = QSpinBox()
         self.spin_filter_min_dur.setRange(0, 600)
         self.spin_filter_min_dur.setPrefix("Min Dur: ")
-        self.spin_filter_min_dur.setSuffix(" min")
+        self.spin_filter_min_dur.setSuffix("m")
         self.spin_filter_min_dur.setSpecialValueText("Min Dur: 0m")
         self.spin_filter_min_dur.valueChanged.connect(self._apply_table_filters)
-        filter_bar.addWidget(self.spin_filter_min_dur, 1)
+        self.spin_filter_min_dur.setMaximumWidth(100)
+        filter_bar.addWidget(self.spin_filter_min_dur)
 
         self.spin_filter_max_dur = QSpinBox()
         self.spin_filter_max_dur.setRange(0, 600)
         self.spin_filter_max_dur.setPrefix("Max Dur: ")
-        self.spin_filter_max_dur.setSuffix(" min")
+        self.spin_filter_max_dur.setSuffix("m")
         self.spin_filter_max_dur.setSpecialValueText("Max Dur: Any")
         self.spin_filter_max_dur.valueChanged.connect(self._apply_table_filters)
-        filter_bar.addWidget(self.spin_filter_max_dur, 1)
+        self.spin_filter_max_dur.setMaximumWidth(100)
+        filter_bar.addWidget(self.spin_filter_max_dur)
 
         self.combo_filter_date = QComboBox()
         self.combo_filter_date.addItems(["All Dates", "Last 30 Days", "Last 3 Months", "Last Year"])
         self.combo_filter_date.currentTextChanged.connect(self._apply_table_filters)
-        filter_bar.addWidget(self.combo_filter_date, 1)
+        self.combo_filter_date.setMaximumWidth(105)
+        filter_bar.addWidget(self.combo_filter_date)
 
         self.combo_filter_type = QComboBox()
         self.combo_filter_type.addItems(["All Types", "Videos Only", "Shorts Only"])
         self.combo_filter_type.currentTextChanged.connect(self._apply_table_filters)
-        filter_bar.addWidget(self.combo_filter_type, 1)
+        self.combo_filter_type.setMaximumWidth(100)
+        filter_bar.addWidget(self.combo_filter_type)
 
         btn_reset_filters = QPushButton("✕ Reset")
         btn_reset_filters.setToolTip("Reset all table search and filter criteria")
@@ -1314,9 +1343,8 @@ class ChannelView(QWidget):
         self._update_thumb_checkbox_label()
 
     def _update_thumb_checkbox_label(self):
-        val = self.spin_thumb_count.value() if hasattr(self, "spin_thumb_count") else 50
         if hasattr(self, "chk_thumbnails"):
-            self.chk_thumbnails.setText(f"2. Thumbnails (Thumbnails/ | Total: {val})")
+            self.chk_thumbnails.setText("2. Thumbnails (Thumbnails/)")
 
     def _on_script_concurrency_changed(self, val: int):
         self.settings.script_concurrent_downloads = val
@@ -1324,9 +1352,8 @@ class ChannelView(QWidget):
         self._update_script_checkbox_label()
 
     def _update_script_checkbox_label(self):
-        val = self.spin_script_concurrency.value() if hasattr(self, "spin_script_concurrency") else 3
         if hasattr(self, "chk_scripts"):
-            self.chk_scripts.setText(f"4. Scripts (Scripts/ | ⚡ {val} Parallel)")
+            self.chk_scripts.setText("4. Scripts (Scripts/)")
 
     def _on_audio_concurrency_changed(self, val: int):
         self.settings.audio_concurrent_downloads = val
@@ -1336,9 +1363,8 @@ class ChannelView(QWidget):
         self._update_audio_checkbox_label()
 
     def _update_audio_checkbox_label(self):
-        val = self.spin_audio_concurrency.value() if hasattr(self, "spin_audio_concurrency") else 3
         if hasattr(self, "chk_mp3s"):
-            self.chk_mp3s.setText(f"5. Audio (Audio/ | ⚡ {val} Parallel)")
+            self.chk_mp3s.setText("5. Audio (MP3)")
 
     def _browse_dir(self):
         d = QFileDialog.getExistingDirectory(self, "Select Output Folder", self.txt_out_dir.text())
