@@ -42,6 +42,7 @@ from PySide6.QtGui import QColor, QFont
 from PySide6.QtCore import Qt, Signal, QThread, QTimer
 
 from app.config import (
+    APP_VERSION,
     AUDIO_FORMATS,
     AUDIO_QUALITIES,
     DEFAULT_AUDIO_QUALITY,
@@ -562,7 +563,7 @@ class ChannelView(QWidget):
         layout.setSpacing(14)
 
         # Header
-        lbl_title = QLabel("Channel & Media Downloader Pro v3.6")
+        lbl_title = QLabel(f"Channel & Media Downloader Pro v{APP_VERSION}")
         lbl_title.setObjectName("viewTitle")
         lbl_sub = QLabel(
             "Unified YouTube data extractor with Chronological & Popularity V-Numbering (Newest, Oldest, Most Popular, Least Popular), "
@@ -2413,6 +2414,8 @@ class ChannelView(QWidget):
         force_overwrite = bool(self.chk_mode_force_overwrite.isChecked()) if hasattr(self, "chk_mode_force_overwrite") else False
         missing_only = bool(self.chk_mode_missing_only.isChecked()) if hasattr(self, "chk_mode_missing_only") else True
 
+        has_media = bool((want_mp3s and audio_candidates) or (want_videos and video_candidates))
+
         self._phased_pipeline_state = {
             "base_dir": base_dir,
             "selected": active_selected,
@@ -2428,8 +2431,9 @@ class ChannelView(QWidget):
             "title_candidates": title_candidates,
             "thumb_candidates": thumb_candidates,
             "script_candidates": script_candidates,
-            "audio_candidates": combined_media_candidates,
+            "audio_candidates": audio_candidates,
             "video_candidates": video_candidates,
+            "media_candidates": combined_media_candidates,
             "thumb_count": thumb_count,
             "script_concurrency": script_concurrency,
             "audio_concurrency": audio_concurrency,
@@ -2440,7 +2444,7 @@ class ChannelView(QWidget):
             "thumbs_done": not bool(want_thumbnails and thumb_candidates),
             "assets_done": not want_channel_assets,
             "scripts_done": not bool(want_scripts and script_candidates),
-            "media_done": not bool((want_mp3s or want_videos) and audio_candidates),
+            "media_done": not has_media,
             # Counts
             "titles_saved": 0,
             "thumbs_saved": 0,
@@ -2449,6 +2453,10 @@ class ChannelView(QWidget):
             "scripts_saved": 0,
             "scripts_skipped": 0,
             "media_items_map": {},
+            "audio_completed_count": 0,
+            "audio_failed_count": 0,
+            "video_completed_count": 0,
+            "video_failed_count": 0,
             "media_completed_count": 0,
             "media_failed_count": 0,
             "failed_items": [],
@@ -2462,7 +2470,16 @@ class ChannelView(QWidget):
         self.lbl_prog_thumbs.setText("🖼️ <b>2. Thumbnails:</b> " + (f"Waiting... ({len(thumb_candidates)} thumbs)" if thumb_candidates else "Not Selected"))
         self.lbl_prog_assets.setText("🎨 <b>3. Channel Assets:</b> " + ("Waiting..." if want_channel_assets else "Not Selected"))
         self.lbl_prog_scripts.setText("📜 <b>4. Scripts:</b> " + (f"Waiting... ({len(script_candidates)} scripts, ⚡ {script_concurrency} streams)" if script_candidates else "Not Selected"))
-        self.lbl_prog_media.setText("🎵 <b>5. Audio/Media:</b> " + (f"Waiting... ({len(audio_candidates)} items, ⚡ {audio_concurrency} streams)" if audio_candidates else "Not Selected"))
+        
+        v_qual = self.combo_video_quality.currentText() if hasattr(self, "combo_video_quality") else "Best"
+        if want_mp3s and want_videos and audio_candidates and video_candidates:
+            self.lbl_prog_media.setText(f"🎵 <b>5. Audio:</b> Waiting... ({len(audio_candidates)}) | 🎬 <b>Videos:</b> Waiting... ({len(video_candidates)})")
+        elif want_mp3s and audio_candidates:
+            self.lbl_prog_media.setText(f"🎵 <b>5. Audio:</b> Waiting... ({len(audio_candidates)} audio, ⚡ {audio_concurrency} streams)")
+        elif want_videos and video_candidates:
+            self.lbl_prog_media.setText(f"🎬 <b>5. Videos:</b> Waiting... ({len(video_candidates)} videos, {v_qual})")
+        else:
+            self.lbl_prog_media.setText("🎵 <b>5. Audio/Media:</b> Not Selected")
 
         # Launch Phase 1: Titles
         self._run_phase_1_titles()
@@ -2680,10 +2697,10 @@ class ChannelView(QWidget):
                 media_items.append(item)
                 state["media_items_map"][item.id] = item
 
-        if state["want_videos"] and state["audio_candidates"]:
+        if state["want_videos"] and state["video_candidates"]:
             v_dir = state["base_dir"] / "Videos"
             v_dir.mkdir(parents=True, exist_ok=True)
-            for cand in state["audio_candidates"]:
+            for cand in state["video_candidates"]:
                 item = DownloadItem(
                     url=cand.url,
                     media_type="Video",
@@ -2701,12 +2718,26 @@ class ChannelView(QWidget):
 
         if media_items:
             conc = state["audio_concurrency"]
-            self.lbl_prog_media.setText(f"🎵 <b>5. Audio/Media:</b> Queued {len(media_items)} tasks (⚡ {conc} Simultaneous)...")
+            v_qual = self.combo_video_quality.currentText() if hasattr(self, "combo_video_quality") else "Best"
+            if state.get("want_mp3s") and state.get("want_videos"):
+                self.lbl_prog_media.setText(
+                    f"🎵 <b>5. Audio:</b> 0/{len(state['audio_candidates'])} | 🎬 <b>Videos:</b> 0/{len(state['video_candidates'])} (⚡ {conc} Concurrent)"
+                )
+            elif state.get("want_mp3s"):
+                self.lbl_prog_media.setText(f"🎵 <b>5. Audio:</b> 0/{len(state['audio_candidates'])} (⚡ {conc} Concurrent)")
+            else:
+                self.lbl_prog_media.setText(f"🎬 <b>5. Videos:</b> 0/{len(state['video_candidates'])} ({v_qual})")
 
-            for cand in state["audio_candidates"]:
-                cur = getattr(cand, "status_text", "")
-                if not cur or cur == "Queued":
-                    self._update_candidate_status(cand.video_id, "Downloading Audio")
+            if state.get("want_mp3s"):
+                for cand in state.get("audio_candidates", []):
+                    cur = getattr(cand, "status_text", "")
+                    if not cur or cur == "Queued":
+                        self._update_candidate_status(cand.video_id, "Downloading Audio")
+            if state.get("want_videos"):
+                for cand in state.get("video_candidates", []):
+                    cur = getattr(cand, "status_text", "")
+                    if not cur or cur == "Queued":
+                        self._update_candidate_status(cand.video_id, "Downloading Video")
 
             try:
                 self.queue_manager.item_completed.disconnect(self._on_phased_media_completed)
@@ -2807,7 +2838,12 @@ class ChannelView(QWidget):
         state = getattr(self, "_phased_pipeline_state", None) or getattr(self, "_parallel_state", None)
         if not state or item.id not in state["media_items_map"]:
             return
-        state["media_completed_count"] += 1
+        if getattr(item, "media_type", "") == "Audio":
+            state["audio_completed_count"] = state.get("audio_completed_count", 0) + 1
+        elif getattr(item, "media_type", "") == "Video":
+            state["video_completed_count"] = state.get("video_completed_count", 0) + 1
+        state["media_completed_count"] = state.get("media_completed_count", 0) + 1
+
         if item.video_id:
             self._update_candidate_status(item.video_id, "Completed")
         total_media = len(state["media_items_map"])
@@ -2822,7 +2858,12 @@ class ChannelView(QWidget):
         state = getattr(self, "_phased_pipeline_state", None) or getattr(self, "_parallel_state", None)
         if not state or item.id not in state["media_items_map"]:
             return
-        state["media_failed_count"] += 1
+        if getattr(item, "media_type", "") == "Audio":
+            state["audio_failed_count"] = state.get("audio_failed_count", 0) + 1
+        elif getattr(item, "media_type", "") == "Video":
+            state["video_failed_count"] = state.get("video_failed_count", 0) + 1
+        state["media_failed_count"] = state.get("media_failed_count", 0) + 1
+
         if item.video_id:
             self._update_candidate_status(item.video_id, f"Failed: {err_msg[:25]}")
         state["failed_items"].append({
@@ -2855,15 +2896,42 @@ class ChannelView(QWidget):
         state = getattr(self, "_phased_pipeline_state", None) or getattr(self, "_parallel_state", None)
         if not state or not (state.get("want_mp3s") or state.get("want_videos")):
             return
-        total_media = len(state["media_items_map"])
-        done_c = state["media_completed_count"]
-        fail_c = state["media_failed_count"]
+
+        want_audio = state.get("want_mp3s")
+        want_video = state.get("want_videos")
+        audio_tot = len(state.get("audio_candidates", []))
+        video_tot = len(state.get("video_candidates", []))
+        audio_done = state.get("audio_completed_count", 0)
+        audio_fail = state.get("audio_failed_count", 0)
+        video_done = state.get("video_completed_count", 0)
+        video_fail = state.get("video_failed_count", 0)
         conc = state.get("audio_concurrency", 3)
-        status_text = f"🎵 <b>5. Audio/Media:</b> {done_c}/{total_media} (⚡ {conc} Simultaneous)"
-        if fail_c > 0:
-            status_text += f" | ❌ {fail_c} Failed"
-        if state["media_done"]:
-            status_text = f"🎵 <b>5. Audio/Media:</b> ✓ Complete ({done_c}/{total_media})"
+        v_qual = getattr(self, "combo_video_quality", None)
+        v_qual_text = v_qual.currentText() if v_qual else "Best"
+
+        parts = []
+        if want_audio:
+            part = f"🎵 <b>5. Audio:</b> {audio_done}/{audio_tot}"
+            if audio_fail > 0:
+                part += f" (❌ {audio_fail} Failed)"
+            parts.append(part)
+
+        if want_video:
+            prefix = "🎬 <b>5. Videos:</b> " if not want_audio else "🎬 <b>Videos:</b> "
+            part = f"{prefix}{video_done}/{video_tot}"
+            if video_fail > 0:
+                part += f" (❌ {video_fail} Failed)"
+            parts.append(part)
+
+        if state.get("media_done"):
+            status_text = " | ".join(p.replace("<b>", "<b>✓ ") for p in parts)
+        else:
+            status_text = " | ".join(parts)
+            if want_audio and not want_video:
+                status_text += f" (⚡ {conc} Concurrent)"
+            elif want_video and not want_audio:
+                status_text += f" ({v_qual_text})"
+
         self.lbl_prog_media.setText(status_text)
 
     def _update_phased_overall_progress(self):
@@ -2947,38 +3015,65 @@ class ChannelView(QWidget):
                         "candidate": cand,
                     })
 
+        audio_cand_len = len(state.get("audio_candidates", []))
+        video_cand_len = len(state.get("video_candidates", []))
+        audio_done = state.get("audio_completed_count", 0)
+        audio_fail = state.get("audio_failed_count", 0)
+        video_done = state.get("video_completed_count", 0)
+        video_fail = state.get("video_failed_count", 0)
+
+        scripts_cand_len = len(state.get("script_candidates", []))
+        scripts_saved = state.get("scripts_saved", 0)
+        scripts_skip = state.get("scripts_skipped", 0)
+
+        thumbs_cand_len = len(state.get("thumb_candidates", []))
+        thumbs_saved = state.get("thumbs_saved", 0)
+        thumbs_skip = state.get("thumbs_skipped", 0)
+
+        titles_cand_len = len(state.get("title_candidates", []))
+        titles_saved = state.get("titles_saved", titles_cand_len)
+
+        assets_saved = state.get("assets_saved", 0)
+
         total_succ = (
-            state.get("titles_saved", 0)
-            + state.get("thumbs_saved", 0)
-            + state.get("scripts_saved", 0)
-            + state.get("media_completed_count", 0)
-            + state.get("assets_saved", 0)
+            (titles_saved if state.get("want_titles") else 0)
+            + (thumbs_saved if state.get("want_thumbnails") else 0)
+            + (scripts_saved if state.get("want_scripts") else 0)
+            + (audio_done if state.get("want_mp3s") else 0)
+            + (video_done if state.get("want_videos") else 0)
+            + (assets_saved if state.get("want_channel_assets") else 0)
         )
-        total_skip = state.get("thumbs_skipped", 0) + state.get("scripts_skipped", 0)
+        total_skip = thumbs_skip + scripts_skip
+
+        v_qual = getattr(self, "combo_video_quality", None)
+        v_qual_text = v_qual.currentText() if v_qual else "Best"
 
         stats = {
             "total_videos": len(selected),
             "total_succeeded": total_succ,
             "total_skipped": total_skip,
-            "titles_status": f"1 master file at {base_dir / 'Titles.txt'}" if state.get("want_titles") else "Not Selected",
+            "titles_status": (
+                f"{titles_saved} / {titles_cand_len} titles in Titles.txt"
+                if state.get("want_titles") else "Not Selected"
+            ),
             "thumbnails_status": (
-                f"{state.get('thumbs_saved', 0)} saved (target: {len(state.get('thumb_candidates', []))}), {state.get('thumbs_skipped', 0)} skipped"
+                f"{thumbs_saved} / {thumbs_cand_len} saved" + (f" ({thumbs_skip} existing)" if thumbs_skip > 0 else "")
                 if state.get("want_thumbnails") else "Not Selected"
             ),
             "assets_status": (
-                f"Saved into {base_dir / 'Channel Assets'}"
+                f"{assets_saved} saved into Channel Assets"
                 if state.get("want_channel_assets") else "Not Selected"
             ),
             "scripts_status": (
-                f"{state.get('scripts_saved', 0)} saved, {state.get('scripts_skipped', 0)} skipped (⚡ {state.get('script_concurrency', 3)} concurrent)"
+                f"{scripts_saved} / {scripts_cand_len} saved (⚡ {state.get('script_concurrency', 3)} concurrent)" + (f" [{scripts_skip} cached]" if scripts_skip > 0 else "")
                 if state.get("want_scripts") else "Not Selected"
             ),
             "audio_status": (
-                f"{state.get('media_completed_count', 0)} completed (⚡ {state.get('audio_concurrency', 3)} concurrent)"
+                f"{audio_done} / {audio_cand_len} completed" + (f" (❌ {audio_fail} failed)" if audio_fail > 0 else "") + f" (⚡ {state.get('audio_concurrency', 3)} concurrent)"
                 if state.get("want_mp3s") else "Not Selected"
             ),
             "video_status": (
-                f"{state.get('media_completed_count', 0)} completed ({self.combo_video_quality.currentText()})"
+                f"{video_done} / {video_cand_len} completed" + (f" (❌ {video_fail} failed)" if video_fail > 0 else "") + f" ({v_qual_text})"
                 if state.get("want_videos") else "Not Selected"
             ),
         }

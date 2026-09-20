@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "Multi Downloader"
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.7.0"
 ORGANIZATION = "Antigravity Engineering"
 
 

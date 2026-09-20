@@ -65,8 +65,8 @@ class TestV36Features(unittest.TestCase):
 
     # 1. Version Test
     def test_01_version_bump_360(self):
-        """Verify APP_VERSION is bumped to 3.6.0."""
-        self.assertEqual(APP_VERSION, "3.6.0")
+        """Verify APP_VERSION is bumped to 3.6.0+."""
+        self.assertIn(APP_VERSION, ["3.6.0", "3.7.0"])
 
     # 2. View Count Input Parsing
     def test_02_parse_view_count_input(self):
@@ -399,7 +399,7 @@ class TestV36Features(unittest.TestCase):
         self.assertTrue(dlg.export_txt(txt_file))
         self.assertTrue(txt_file.exists())
         content_txt = txt_file.read_text(encoding="utf-8")
-        self.assertIn("MultiDownloader v3.6.0 - Download Statistics Report", content_txt)
+        self.assertIn(f"MultiDownloader v{APP_VERSION} - Download Statistics Report", content_txt)
         self.assertIn("Failed Items Details:", content_txt)
         self.assertIn("[V4] Fourth Video | Category: Audio | Reason: HTTP 403 Forbidden", content_txt)
 

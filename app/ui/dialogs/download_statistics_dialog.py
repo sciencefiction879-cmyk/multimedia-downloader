@@ -92,7 +92,7 @@ class DownloadStatisticsDialog(QDialog):
         fail_count = len(self.failed_items)
 
         kpi_row.addWidget(self._create_kpi_card("Total Videos", str(total_count), "#007aff"))
-        kpi_row.addWidget(self._create_kpi_card("Succeeded", str(succ_count), "#34c759"))
+        kpi_row.addWidget(self._create_kpi_card("Files Saved", str(succ_count), "#34c759"))
         kpi_row.addWidget(self._create_kpi_card("Skipped (On Disk)", str(skip_count), "#0a84ff"))
         kpi_row.addWidget(self._create_kpi_card("Failed Items", str(fail_count), "#ff3b30" if fail_count > 0 else "#8e8e93"))
 

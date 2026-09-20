@@ -46,7 +46,7 @@ class TestV35Features(unittest.TestCase):
 
     def test_01_version_and_config(self):
         """Test v3.5.0 version string and updated limits."""
-        self.assertIn(APP_VERSION, ["3.5.0", "3.6.0"])
+        self.assertIn(APP_VERSION, ["3.5.0", "3.6.0", "3.7.0"])
         self.assertEqual(MAX_CONCURRENT_DOWNLOADS, 500)
         self.assertEqual(DEFAULT_MAX_RETRIES, 5)
         self.assertIn(ORDER_POPULAR_TO_LEAST, CHANNEL_ORDER_OPTIONS)
